@@ -133,8 +133,8 @@ public sealed class SurfaceService
 
         foreach (var q in quotes)
         {
-            int ti = NearestIndex(expiries, q.Maturity, 1e-6);
-            int ki = NearestIndex(strikes, q.Strike, 1e-6);
+            int ti = NearestIndex(expiries, q.Maturity, 1/365.0);
+            int ki = NearestIndex(strikes, q.Strike, 1/365.0);
             if (ti < 0 || ki < 0) continue;
 
             double mid = 0.5 * (q.Bid + q.Ask);

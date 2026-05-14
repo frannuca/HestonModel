@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>HestonVolCalibrator.Web</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\HestonVolCalibrator\HestonVolCalibrator.csproj" />
+    <ProjectReference Include="..\HestonVolCalibrator.DataLoader\HestonVolCalibrator.DataLoader.csproj" />
+  </ItemGroup>
+</Project>

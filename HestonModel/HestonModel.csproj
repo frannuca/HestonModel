@@ -1,0 +1,15 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="../HestonVolCalibrator/HestonVolCalibrator.csproj" />
+        <ProjectReference Include="../HestonVolCalibrator.DataLoader/HestonVolCalibrator.DataLoader.csproj" />
+    </ItemGroup>
+
+</Project>

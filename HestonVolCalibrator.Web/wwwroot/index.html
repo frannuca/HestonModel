@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Heston Vol Calibration</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+</head>
+<body>
+  <header class="app-header">
+    <h1>Heston Vol Calibration</h1>
+    <p class="subtitle">Fit Heston stochastic volatility parameters to an implied-volatility surface.</p>
+  </header>
+
+  <div id="errorBanner" class="error-banner hidden"></div>
+
+  <section class="card">
+    <div class="control-row">
+      <div class="control">
+        <label for="ticker">Ticker</label>
+        <input id="ticker" type="text" value="^SPX" placeholder="e.g. ^SPX, AAPL, ^NDX" />
+      </div>
+      <div class="control">
+        <label for="maxExpiries">Max expiries</label>
+        <input id="maxExpiries" type="number" value="6" min="1" max="20" />
+      </div>
+      <div class="control checkbox">
+        <label><input id="forceSynthetic" type="checkbox" checked /> Use synthetic surface</label>
+      </div>
+      <div class="control checkbox">
+        <label><input id="cleanQuotes" type="checkbox" checked /> Clean quotes</label>
+      </div>
+      <div class="control">
+        <button id="loadSurfaceBtn" class="primary">Load surface</button>
+      </div>
+      <div id="surfaceStatus" class="status-pill"></div>
+    </div>
+  </section>
+
+  <section id="calibPanel" class="card hidden">
+    <div class="card-header collapsible">
+      <h2>Calibration</h2>
+      <button id="toggleCalibBtn" class="ghost" type="button">Collapse</button>
+    </div>
+    <div id="calibBody" class="calib-body">
+      <div class="grid two-cols">
+        <div class="col">
+          <h3>Optimization pipeline</h3>
+          <div class="control">
+            <label for="globalMethod">Global method</label>
+            <select id="globalMethod">
+              <option value="nelderMead" selected>Nelder-Mead</option>
+              <option value="genetic">Genetic Algorithm</option>
+              <option value="none">None</option>
+            </select>
+          </div>
+          <div class="control">
+            <label for="gradientMethod">Gradient method</label>
+            <select id="gradientMethod">
+              <option value="bfgs">BFGS</option>
+              <option value="bfgsB" selected>L-BFGS-B (box constrained)</option>
+              <option value="none">None</option>
+            </select>
+          </div>
+          <div class="control checkbox">
+            <label><input id="chain" type="checkbox" checked /> Chain global &rarr; gradient</label>
+          </div>
+          <div class="control" id="nmRestartsWrap">
+            <label for="nmRestarts">Nelder-Mead restarts</label>
+            <input id="nmRestarts" type="number" value="5" min="0" max="100" />
+          </div>
+          <div class="control">
+            <label for="globalMaxIter">Global max iterations</label>
+            <input id="globalMaxIter" type="number" value="2000" min="1" />
+          </div>
+          <div class="control">
+            <label for="gradMaxIter">Gradient max iterations</label>
+            <input id="gradMaxIter" type="number" value="500" min="1" />
+          </div>
+        </div>
+        <div class="col">
+          <h3>Parameter bounds</h3>
+          <div class="bounds-grid" id="boundsGrid">
+            <div class="bounds-header"><span>Param</span><span>Lower</span><span>Upper</span></div>
+            <div class="bounds-row" data-key="kappa">
+              <span class="pname">&kappa; (kappa)</span>
+              <input type="number" class="lower" step="0.01" value="0.01" />
+              <input type="number" class="upper" step="0.1" value="20" />
+            </div>
+            <div class="bounds-row" data-key="theta">
+              <span class="pname">&theta; (theta)</span>
+              <input type="number" class="lower" step="0.0001" value="0.0001" />
+              <input type="number" class="upper" step="0.01" value="1.0" />
+            </div>
+            <div class="bounds-row" data-key="sigma">
+              <span class="pname">&sigma; (sigma of vol)</span>
+              <input type="number" class="lower" step="0.01" value="0.01" />
+              <input type="number" class="upper" step="0.1" value="5.0" />
+            </div>
+            <div class="bounds-row" data-key="rho">
+              <span class="pname">&rho; (rho)</span>
+              <input type="number" class="lower" step="0.01" value="-0.99" />
+              <input type="number" class="upper" step="0.01" value="0.99" />
+            </div>
+            <div class="bounds-row" data-key="v0">
+              <span class="pname">v&#8320; (v0)</span>
+              <input type="number" class="lower" step="0.0001" value="0.0001" />
+              <input type="number" class="upper" step="0.01" value="1.0" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <p class="help">
+        <em>Bounds are enforced literally only by L-BFGS-B. Nelder-Mead, BFGS, and the Genetic Algorithm apply
+        soft constraints via parameter transforms (positivity for &kappa;, &theta;, &sigma;, v&#8320;; |&rho;|&lt;1).</em>
+      </p>
+
+      <div class="run-row">
+        <button id="runBtn" class="primary">Run calibration</button>
+        <button id="cancelBtn" class="danger hidden">Cancel</button>
+        <label class="mode-toggle">
+          <input type="radio" name="runMode" value="stream" checked /> Streaming
+        </label>
+        <label class="mode-toggle">
+          <input type="radio" name="runMode" value="batch" /> Batch
+        </label>
+        <div id="runStatus" class="status-pill"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tabsSection" class="card hidden">
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="market">Market</button>
+      <button class="tab-btn" data-tab="heston">Heston IV</button>
+      <button class="tab-btn" data-tab="comparison">Comparison</button>
+      <button class="tab-btn" data-tab="smiles">Smiles</button>
+      <button class="tab-btn" data-tab="convergence">Convergence</button>
+      <button class="tab-btn" data-tab="results">Results</button>
+    </div>
+
+    <div class="tab-panel active" id="tab-market">
+      <div class="market-controls control-row">
+        <div class="control market-qty-group">
+          <label>Quantity</label>
+          <div class="qty-toggles">
+            <label class="mode-toggle"><input type="radio" name="marketQty" value="iv" checked /> Implied Vol</label>
+            <label class="mode-toggle"><input type="radio" name="marketQty" value="call" /> Call Price</label>
+            <label class="mode-toggle"><input type="radio" name="marketQty" value="put" /> Put Price</label>
+          </div>
+        </div>
+        <div id="marketSourcePill" class="status-pill market-source-pill"></div>
+        <button id="saveMarketCsvBtn" class="ghost" type="button">Save CSV</button>
+      </div>
+      <div id="plot-market" class="plot"></div>
+
+      <div class="smile-detail-block">
+        <h3 class="smile-detail-title">Smile cut</h3>
+        <div class="control-row smile-detail-controls">
+          <div class="control">
+            <label for="marketCutExpiry">Expiry</label>
+            <select id="marketCutExpiry" disabled></select>
+          </div>
+        </div>
+        <div id="plot-market-cut" class="plot market-cut-plot"></div>
+      </div>
+    </div>
+    <div class="tab-panel" id="tab-heston">
+      <div id="plot-heston" class="plot"></div>
+    </div>
+    <div class="tab-panel" id="tab-comparison">
+      <div id="plot-comparison" class="plot"></div>
+    </div>
+    <div class="tab-panel" id="tab-smiles">
+      <div id="smilesLegend" class="smiles-legend">
+        <span class="legend-item"><span class="dot mkt"></span>Market</span>
+        <span class="legend-item"><span class="line hes"></span>Heston</span>
+        <span id="smilesStatus" class="legend-status"></span>
+      </div>
+      <div id="smilesGrid" class="smiles-grid"></div>
+
+      <div class="smile-detail-block">
+        <h3 class="smile-detail-title">Single-expiry detail</h3>
+        <div class="control-row smile-detail-controls">
+          <div class="control">
+            <label for="expirySelect">Expiry</label>
+            <select id="expirySelect" disabled></select>
+          </div>
+          <div class="control">
+            <label for="smileStrikeCount">Strike count</label>
+            <input id="smileStrikeCount" type="number" value="80" min="10" max="400" />
+          </div>
+          <div class="control">
+            <label for="smileKmin">Kmin</label>
+            <input id="smileKmin" type="number" step="1" />
+          </div>
+          <div class="control">
+            <label for="smileKmax">Kmax</label>
+            <input id="smileKmax" type="number" step="1" />
+          </div>
+          <div class="control">
+            <button id="plotSmileDetailBtn" class="primary">Plot</button>
+          </div>
+        </div>
+        <div id="smileDetail" class="plot smile-detail-plot"></div>
+      </div>
+    </div>
+    <div class="tab-panel" id="tab-convergence">
+      <div id="plot-convergence" class="plot"></div>
+    </div>
+    <div class="tab-panel" id="tab-results">
+      <div class="results-summary">
+        <h3>Calibrated parameters</h3>
+        <table id="resultsTable" class="results-table">
+          <thead><tr><th>Field</th><th>Value</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <p class="results-note">&rarr; See the <strong>Smiles</strong> tab for per-expiry market vs Heston fit.</p>
+
+      <div class="interp-block">
+        <h3>Interpolated Heston surface</h3>
+        <div class="control-row">
+          <div class="control">
+            <label for="interpStrikes">Strike count</label>
+            <input id="interpStrikes" type="number" value="41" min="5" max="201" />
+          </div>
+          <div class="control">
+            <label for="interpMats">Maturity count</label>
+            <input id="interpMats" type="number" value="25" min="5" max="201" />
+          </div>
+          <div class="control">
+            <button id="plotInterpBtn" class="primary">Plot interpolated Heston surface</button>
+          </div>
+        </div>
+        <div id="plot-interp" class="plot"></div>
+      </div>
+    </div>
+  </section>
+
+  <footer class="app-footer">
+    <span>Heston calibration UI &middot; Plotly 3D &middot; vanilla JS</span>
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

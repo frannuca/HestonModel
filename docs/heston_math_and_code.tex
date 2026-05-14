@@ -1,0 +1,614 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black,
+  citecolor=blue!50!black,
+  pdftitle={Heston Stochastic Volatility Model -- Mathematical Implementation and Class Map},
+  pdfauthor={HestonVolCalibrator project}
+}
+
+% C#-ish listings setup
+\definecolor{kw}{rgb}{0.10,0.10,0.55}
+\definecolor{cm}{rgb}{0.25,0.45,0.25}
+\definecolor{st}{rgb}{0.55,0.10,0.10}
+\lstdefinelanguage{CSharp}{
+  morekeywords={abstract,as,base,bool,break,byte,case,catch,char,checked,class,const,continue,decimal,default,delegate,do,double,else,enum,event,explicit,extern,false,finally,fixed,float,for,foreach,goto,if,implicit,in,int,interface,internal,is,lock,long,namespace,new,null,object,operator,out,override,params,private,protected,public,readonly,record,ref,return,sbyte,sealed,short,sizeof,stackalloc,static,string,struct,switch,this,throw,true,try,typeof,uint,ulong,unchecked,unsafe,ushort,using,var,virtual,void,volatile,while,init},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]"
+}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cm}\itshape,
+  stringstyle=\color{st},
+  language=CSharp,
+  showstringspaces=false,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  framerule=0.3pt,
+  xleftmargin=4pt,
+  xrightmargin=4pt,
+  aboveskip=6pt,
+  belowskip=6pt
+}
+
+\title{Heston Stochastic Volatility Model\\\large Mathematical Implementation and Class Map}
+\author{HestonVolCalibrator project}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\clearpage
+
+% ---------------------------------------------------------------------------
+\section{Preface and scope}
+This note documents the mathematics underlying the \texttt{HestonVolCalibrator}
+codebase and maps each formula to the C\# class or file that implements it.
+In scope: Heston (1993) risk-neutral dynamics, characteristic-function pricing
+in the Albrecher ``little trap'' form, Gil-Pelaez probability inversion, Black--Scholes
+implied volatility, the vega-weighted calibration objective, parameter transforms,
+and the four optimization back-ends (Nelder--Mead, GA, BFGS, L-BFGS-B). A short
+section on the quote-cleaning pipeline, curve abstraction, and the web/API surface is included.
+Out of scope: American exercise, dividends as discrete cash, FFT-based pricing,
+Monte Carlo path generation, and Greek calculations beyond Black--Scholes vega.
+
+% ---------------------------------------------------------------------------
+\section{Notation and conventions}
+\begin{itemize}
+\item Time $t$ in years; ACT/365F implicit at the data-loader level.
+\item Continuous compounding throughout: $D(t) = e^{-r t}$, $D_q(t) = e^{-q t}$.
+\item Spot $S_t$, strike $K$, maturity $T$, risk-free rate $r$, dividend yield $q$.
+\item Variance state $v_t \ge 0$; instantaneous variance, not volatility.
+\item Heston parameter vector (canonical order used throughout the codebase):
+\[
+\theta = [\kappa,\ \theta,\ \sigma,\ \rho,\ v_0].
+\]
+We overload the symbol $\theta$ for both the long-run variance and the parameter vector;
+context resolves the ambiguity. The codebase resolves it with the field name \texttt{Theta}.
+\item Sign conventions: $\rho \in (-1, 1)$, $\kappa, \theta, \sigma, v_0 > 0$.
+\end{itemize}
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator/Models/HestonModel.cs} --- \texttt{HestonModelParams} record.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Heston model dynamics}
+Under the risk-neutral measure $\mathbb{Q}$ with bond numeraire,
+\begin{align*}
+dS_t &= (r - q)\, S_t\, dt + \sqrt{v_t}\, S_t\, dW^{(1)}_t,\\
+dv_t &= \kappa\,(\theta - v_t)\, dt + \sigma\sqrt{v_t}\, dW^{(2)}_t,\\
+dW^{(1)}_t\, dW^{(2)}_t &= \rho\, dt.
+\end{align*}
+$v_t$ follows a CIR (square-root) diffusion. The Feller condition
+\[
+2 \kappa \theta > \sigma^2
+\]
+guarantees $v_t > 0$ almost surely. The codebase does \emph{not} enforce this
+constraint: optimizers may freely visit parameters that violate it, since the
+characteristic-function pricer remains well defined as a complex integral even
+when $v$ can touch zero. Box bounds enforce only positivity of $\kappa,\theta,\sigma,v_0$
+and $|\rho| < 1$ (see \S\ref{sec:transforms}).
+
+\paragraph*{CIR conditional moments (background).} Given $v_0$, the CIR variance has
+\begin{align*}
+\mathbb{E}[v_T \mid v_0] &= \theta + (v_0 - \theta)\, e^{-\kappa T},\\
+\mathrm{Var}[v_T \mid v_0] &= \frac{\sigma^2}{\kappa}\,\Big(v_0 - \theta\,\big(1 - \tfrac12 e^{-\kappa T}\big)\Big)\, e^{-\kappa T}(1 - e^{-\kappa T}) + \cdots
+\end{align*}
+The integrated-variance characteristic function is what enters the option pricer
+above; we do not simulate paths anywhere in this codebase.
+
+\paragraph*{Parameter intuition.}
+\begin{itemize}
+\item $\kappa$: speed of mean reversion; larger $\kappa$ flattens the term
+structure of ATM vols.
+\item $\theta$: long-run variance; controls the asymptotic ATM level at long $T$.
+\item $\sigma$: vol of vol; the dominant driver of smile convexity (kurtosis).
+\item $\rho$: leverage / spot-vol correlation; controls smile skew.
+\item $v_0$: short-end ATM vol level.
+\end{itemize}
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator/Models/HestonModel.cs} --- \texttt{HestonModelParams} record and the static \texttt{HestonPricer}.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Characteristic-function pricing}
+\label{sec:cf}
+European call prices follow from the Heston (1993) decomposition
+\[
+C(S, K, T) = S\, e^{-q T}\, P_1 \;-\; K\, e^{-r T}\, P_2,
+\]
+where the risk-neutral probabilities $P_j$ are obtained from the characteristic
+functions $f_j(\phi)$ via the Gil-Pelaez inversion
+\begin{equation*}
+P_j \;=\; \frac12 + \frac{1}{\pi} \int_0^\infty
+\mathrm{Re}\!\left[\frac{e^{-i \phi \ln K}\, f_j(\phi)}{i\phi}\right] d\phi
+\;=\; \frac12 + \frac{1}{\pi} \int_0^\infty
+\frac{\mathrm{Im}\!\left[\, e^{-i \phi \ln K}\, f_j(\phi)\,\right]}{\phi}\, d\phi.
+\end{equation*}
+The second identity uses $1/(i\phi) = -i/\phi$ so that for any complex $z$,
+\[
+\mathrm{Re}\!\left[\frac{z}{i\phi}\right] = \mathrm{Re}\!\left[\frac{-i z}{\phi}\right]
+= \frac{\mathrm{Im}[z]}{\phi}.
+\]
+This is the form actually integrated by the code: the integrand is
+$\mathrm{Im}[\,e^{-i\phi \ln K}\, f_j(\phi)\,]/\phi$, \textbf{not} $\mathrm{Re}[\cdot]$.
+Confusing the two flips the sign of $P_1, P_2$ around $1/2$ and gives prices that
+look superficially plausible at the money but diverge from intrinsic at the wings.
+
+Explicitly, with $f_j(\phi) = \alpha_j(\phi) + i\beta_j(\phi)$ and
+$e^{-i\phi \ln K} = \cos(\phi \ln K) - i\sin(\phi \ln K)$, the integrand simplifies to
+\[
+\frac{\mathrm{Im}[\,e^{-i\phi \ln K}\, f_j(\phi)\,]}{\phi}
+\;=\;
+\frac{\cos(\phi \ln K)\,\beta_j(\phi) - \sin(\phi \ln K)\,\alpha_j(\phi)}{\phi},
+\]
+which matches the inner-loop expression in \texttt{ComputeProb}:
+\begin{lstlisting}
+double cosK = Math.Cos(-phi * logK);   //  cos(phi*lnK)
+double sinK = Math.Sin(-phi * logK);   // -sin(phi*lnK)
+double imag = cosK * cf.Imaginary + sinK * cf.Real;
+sum += imag / phi;
+\end{lstlisting}
+
+\subsection{Albrecher ``little trap'' characteristic function}
+For $j \in \{1,2\}$ define $u_1 = +\tfrac12$, $u_2 = -\tfrac12$,
+$b_1 = \kappa - \rho\sigma$, $b_2 = \kappa$. Let $a = \kappa\theta$ and
+\begin{align*}
+d &= \sqrt{\,(b_j - \rho\sigma\, i\phi)^2 + \sigma^2 (\phi^2 - 2 u_j\, i \phi)\,},\\[2pt]
+g &= \frac{b_j - \rho\sigma\, i\phi \;-\; d}{b_j - \rho\sigma\, i\phi \;+\; d},
+\qquad\text{(\emph{little trap} sign)}\\[2pt]
+D(\phi; T) &= \frac{b_j - \rho\sigma\, i\phi - d}{\sigma^2}\cdot
+\frac{1 - e^{-d T}}{1 - g\, e^{-d T}},\\[2pt]
+C(\phi; T) &= (r-q)\, i\phi\, T \;+\; \frac{a}{\sigma^2}\!\left[\,
+(b_j - \rho\sigma\, i\phi - d)\, T \;-\; 2 \ln\!\frac{1 - g\, e^{-d T}}{1 - g}\,\right],\\[2pt]
+f_j(\phi) &= \exp\!\big(\,C(\phi;T) + D(\phi;T)\, v_0 + i\phi\, \ln S\,\big).
+\end{align*}
+The Albrecher form is numerically stable because $g$ has modulus $\le 1$ on the
+integration contour, avoiding the branch crossings of the original Heston (1993)
+parameterisation. The relevant snippet (note the sign of $d$ inside $g$):
+
+\begin{lstlisting}
+Complex bPart = b - rho * sigma * iPhi;
+Complex d = Complex.Sqrt(bPart*bPart + sigma*sigma*(phi*phi - 2.0*u*iPhi));
+Complex numG = bPart - d;                  // numerator: b - rho*sigma*i*phi - d
+Complex G    = numG / (bPart + d);         // denominator: b - rho*sigma*i*phi + d
+\end{lstlisting}
+
+\subsection{Integration}
+The integral is computed with the composite midpoint rule on
+$\phi \in [0, \phi_{\max}]$ with $N$ panels:
+\[
+\int_0^{\phi_{\max}} g(\phi)\, d\phi \;\approx\; \Delta\phi \sum_{k=1}^{N} g\!\big((k - \tfrac12)\Delta\phi\big),
+\qquad \Delta\phi = \phi_{\max}/N.
+\]
+Defaults: $N = 1000$, $\phi_{\max} = 100$. The midpoint rule avoids the removable
+singularity of the integrand at $\phi=0$.
+
+Put prices use put-call parity:
+\[
+P(S,K,T) \;=\; C(S,K,T) \;-\; S\, e^{-q T} \;+\; K\, e^{-r T}.
+\]
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator/Models/HestonModel.cs} --- \texttt{HestonPricer.CharFunc} (the $f_j$ above), \texttt{HestonPricer.ComputeProb} (Gil-Pelaez midpoint quadrature), \texttt{HestonPricer.CallPrice} and \texttt{HestonPricer.PutPrice}.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Implied volatility inversion}
+\label{sec:iv}
+For a call price $C$, the Black--Scholes implied volatility $\sigma_{\text{BS}}$
+solves
+\[
+C \;=\; S\, e^{-q T}\, \Phi(d_1) \;-\; K\, e^{-r T}\, \Phi(d_2),
+\quad
+d_{1,2} = \frac{\ln(S\, e^{-q T} / (K\, e^{-r T})) \pm \tfrac12 \sigma^2 T}{\sigma \sqrt{T}}.
+\]
+The map $\sigma \mapsto C(\sigma)$ is strictly increasing on $(0,\infty)$ with
+$\partial C/\partial \sigma = \nu > 0$, so Newton's method converges from any
+positive starting point provided $C$ is strictly inside the no-arbitrage bounds.
+The implementation performs at most 100 iterations and exits early on either
+a small parameter step or a vanishing vega.
+The codebase implements $\Phi$ via the Abramowitz--Stegun rational approximation of $\mathrm{erf}$,
+and the vega
+\[
+\nu \;=\; S\, e^{-q T}\, \varphi(d_1)\, \sqrt{T},
+\qquad \varphi(x) = \frac{1}{\sqrt{2\pi}}\, e^{-x^2/2}.
+\]
+Newton iterates are safeguarded by:
+\begin{itemize}
+\item rejecting prices at or below intrinsic ($C \le \max(S e^{-qT} - K e^{-rT}, 0) + 10^{-9}$);
+\item a Brenner--Subrahmanyam ATM seed $\sigma_0 = \sqrt{2\pi/T}\, C/(S\, e^{-qT})$, clipped to $[0.001, 5]$;
+\item per-step clipping of $\sigma$ to the same interval;
+\item early exit when $|\sigma_{n+1} - \sigma_n| < 10^{-9}$ or when $\nu < 10^{-12}$.
+\end{itemize}
+The data-loader's \texttt{ImpliedVolSolver} converts puts to equivalent call prices
+through put-call parity, rejects strikes outside $[0.7 S,\ 1.3 S]$, and discards
+implied vols outside $[0.01,\ 2.0]$.
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator/Implementations/BlackScholes.cs} --- \texttt{NormalCdf}, \texttt{NormalPdf}, BS call/put.
+\item \texttt{HestonVolCalibrator/Models/HestonModel.cs} --- \texttt{HestonPricer.BsImpliedVol} (safeguarded Newton).
+\item \texttt{HestonVolCalibrator.DataLoader/ImpliedVolSolver.cs} --- put-to-call parity wrapper and moneyness/IV sanity filters.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Calibration objective}
+\label{sec:objective}
+For each sample point $i = 1,\dots, N$ on the $(T_i, K_i)$ grid, let
+$\sigma^{\mathrm{mkt}}_i$ be the market implied vol read from the surface and
+$\sigma^{\mathrm{mod}}_i(\theta) = $ \texttt{HestonPricer.ImpliedVol}$(\theta, S, K_i, T_i, r, q)$
+be the model's implied vol at parameters $\theta$. The objective is a
+\emph{vega-weighted} root-mean-square IV error:
+\[
+\mathcal{L}(\theta) \;=\;
+\sqrt{\frac{\sum_{i=1}^N w_i\,\big(\sigma^{\mathrm{mod}}_i(\theta) - \sigma^{\mathrm{mkt}}_i\big)^2}{\sum_{i=1}^N w_i}},
+\qquad
+w_i \;=\; \max\!\Big(\varphi(d^{(i)}_1)\,\sqrt{T_i},\ 10^{-6}\Big),
+\]
+where $d^{(i)}_1$ is the Black--Scholes $d_1$ evaluated at the \emph{market} vol
+$\sigma^{\mathrm{mkt}}_i$ (so weights are fixed per call). Note that the implementation
+uses $w_i = \varphi(d_1)\sqrt{T}$ (Black--Scholes \emph{normalized} vega up to the $S e^{-qT}$
+factor) rather than full dollar vega; this keeps the weights of comparable magnitude
+across maturities. Pathological evaluations (NaN/Inf model vol, all weights tiny)
+return \texttt{double.MaxValue} so optimizers can detect them.
+
+\paragraph*{Why vega-weight?} Two interpretations:
+\begin{enumerate}
+\item Heuristic: low-vega quotes (deep OTM, very short or long $T$) carry little
+information about the local smile shape because small price perturbations cause
+large IV swings. Weighting by $\nu$ down-weights them.
+\item Statistical: if quote noise is roughly homoskedastic in \emph{price} space,
+then by the implicit function theorem the IV-space noise has standard deviation
+$\propto 1/\nu$. Weighting by $\nu$ (squared inside the sum, with $\nu^2$
+absorbing one factor in the residual and one in $w_i$) is the heteroskedasticity
+correction that recovers the price-space normal-likelihood MLE up to a constant.
+\end{enumerate}
+The code uses $w_i = \varphi(d_1)\sqrt{T_i}$ rather than full dollar vega
+$S e^{-qT}\varphi(d_1)\sqrt{T}$; the $S e^{-qT}$ factor is the same for every
+quote at a given $T$ (after normalization across maturities its omission is
+immaterial) and keeps the weights $O(1)$.
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator/Calibration/VegaWeightedObjective.cs} --- the objective.
+\item \texttt{HestonVolCalibrator/Calibration/HestonCalibrator.cs} --- builds the sample grid from the surface and orchestrates global $\to$ gradient calibration.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Parameter transforms}
+\label{sec:transforms}
+Unconstrained optimizers (Nelder--Mead, BFGS) operate in a transformed space
+that automatically enforces the natural domain:
+\begin{align*}
+q_j &= \ln \theta_j  &&\text{for } j \in \{\kappa, \theta, \sigma, v_0\}, \quad \theta_j > 0,\\
+q_\rho &= \mathrm{atanh}(\rho) = \tfrac12 \ln\!\frac{1+\rho}{1-\rho}  &&\rho \in (-1, 1).
+\end{align*}
+Inverse map:
+\[
+\theta_j = e^{q_j}\ \ (j \in \{\kappa, \theta, \sigma, v_0\}), \qquad \rho = \tanh(q_\rho).
+\]
+The codebase clamps $\rho$ to $[-0.999, 0.999]$ before \texttt{atanh} to avoid $\pm\infty$.
+By construction the transformed search space is $\mathbb{R}^5$, so the optimizer
+need not enforce bounds explicitly. L-BFGS-B (\S\ref{sec:bfgsb}) is the one
+exception: it operates in raw space so that user-specified box bounds are
+honoured literally.
+
+\paragraph*{Trade-offs.} Working in transformed space removes constraints but
+also reshapes the loss landscape: $\log\kappa$ and $\log\theta$ make the objective
+flatter near zero, which can slow gradient methods when the optimum is small.
+For L-BFGS-B (which has native bound support), raw space is the right choice.
+The \texttt{atanh} transform is essential for $\rho$: without it, an unconstrained
+optimizer routinely overshoots $\rho \to \pm 1$ during line search, at which
+point the characteristic-function denominator $(1 - \rho^2)$-like terms blow up.
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator/Calibration/ParamTransforms.cs} --- \texttt{Encode}/\texttt{Decode} and \texttt{TransformedObjective}.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Optimization pipeline}
+
+\subsection{Nelder--Mead simplex}
+A custom Nelder--Mead implementation in transformed space. Standard coefficients:
+\[
+\alpha = 1\ \text{(reflection)},\quad
+\gamma = 2\ \text{(expansion)},\quad
+\rho_c = 0.5\ \text{(contraction)},\quad
+\sigma = 0.5\ \text{(shrink)}.
+\]
+The initial simplex perturbs each coordinate by \texttt{InitialPerturbation = [0.5, 0.5, 0.5, 0.3, 0.5]}
+in transformed space. Convergence is by the spread $f_{n} - f_0$ of simplex
+function values against \texttt{opts.Tolerance} ($10^{-8}$ by default).
+Multi-start: from \texttt{Restarts} starting points, each obtained by adding
+uniform jitter in $[-1,1]\cdot \texttt{RestartJitter}$ with
+\texttt{RestartJitter = [0.8, 0.8, 0.8, 0.5, 0.8]} to the encoded $q_0$.
+The best-so-far is reported through the iteration callback.
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator/Calibration/NelderMeadOptimizer.cs} --- \texttt{RunSimplex} + multi-start driver.
+\end{itemize}
+
+\subsection{Genetic algorithm}
+Wraps the \texttt{GeneticSharp} library. Real-valued chromosome of length 5,
+one gene per Heston parameter, each encoded as a 64-bit
+\texttt{FloatingPointChromosome}. The 64-bit width is required: GeneticSharp's
+\texttt{BinaryStringRepresentation} encodes via \texttt{BitConverter.GetBytes((long)\dots)}
+which is always 64 bits; using fewer bits with a range that crosses zero
+(notably $\rho \in (-1,1)$) yields a chromosome that cannot represent negative
+values without sign-extension artifacts. Defaults:
+\begin{itemize}
+\item Population: 50 (fixed min = max).
+\item Selection: elite.
+\item Crossover: uniform with mixing probability $0.5$, overall probability $0.75$.
+\item Mutation: flip-bit, probability $0.25$.
+\item Termination: fixed generation count (default 100, overridable via \texttt{GenerationsOverride}).
+\end{itemize}
+The objective is minimized by maximizing $-f$ (GeneticSharp maximizes fitness).
+The GA runs in \emph{raw} parameter space honouring \texttt{obj.Lower} and
+\texttt{obj.Upper}.
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator/Calibration/GeneticOptimizer.cs} --- chromosome construction and GA loop.
+\end{itemize}
+
+\subsection{BFGS (unconstrained, transformed space)}
+Math.NET's \texttt{BfgsMinimizer} on the transformed objective. Hessian inverse
+$H_k$ is updated via the standard BFGS secant
+\[
+H_{k+1} = \Big(I - \frac{s_k y_k^\top}{y_k^\top s_k}\Big) H_k
+\Big(I - \frac{y_k s_k^\top}{y_k^\top s_k}\Big) + \frac{s_k s_k^\top}{y_k^\top s_k},
+\quad
+s_k = q_{k+1} - q_k,\ y_k = g_{k+1} - g_k.
+\]
+The search direction is $p_k = -H_k g_k$ and the next iterate is
+$q_{k+1} = q_k + \alpha_k p_k$ with $\alpha_k$ chosen by a Wolfe-condition line
+search (Math.NET internal). Because the objective is evaluated in
+transformed space, $g_k = \partial \mathcal{L}/\partial q$ relates to the
+raw-space gradient via the chain rule with diagonal Jacobian
+$\mathrm{diag}(e^{q_1}, e^{q_2}, e^{q_3}, 1 - \tanh^2(q_4), e^{q_5})$; the
+finite-difference recipe handles this implicitly by differentiating the composed
+function.
+
+Gradients are computed by central differences in transformed space with
+$\varepsilon = 10^{-5}$:
+\begin{lstlisting}
+qa[i] = orig + eps;  double fp = t.Evaluate(qa);
+qa[i] = orig - eps;  double fm = t.Evaluate(qa);
+g[i]  = (fp - fm) / (2.0 * eps);
+\end{lstlisting}
+Stopping tolerances: gradient $10^{-6}$, parameter step $10^{-8}$,
+function progress $10^{-10}$.
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator/Calibration/BfgsOptimizer.cs} --- gradient and minimizer wiring.
+\end{itemize}
+
+\subsection{L-BFGS-B (box-constrained, raw space)}
+\label{sec:bfgsb}
+Math.NET's \texttt{BfgsBMinimizer} on the \emph{raw} objective. The whole point
+of L-BFGS-B is to respect bounds literally, so we do not compose with
+\texttt{ParamTransforms}. The starting point is clamped strictly inside the box,
+and the finite-difference gradient uses a \emph{reflective} stencil at the edges:
+\[
+g_i \;=\; \frac{f(x + h_+ e_i) - f(x - h_- e_i)}{h_+ + h_-},\quad
+\text{with } h_+ = \min(\varepsilon, U_i - x_i),\ h_- = \min(\varepsilon, x_i - L_i).
+\]
+This keeps both stencil arms inside $[L_i, U_i]$. Tolerances and $\varepsilon = 10^{-5}$
+match the unconstrained BFGS.
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator/Calibration/BfgsBOptimizer.cs}.
+\end{itemize}
+
+\subsection{Comparison of the four optimizers}
+\begin{itemize}
+\item \textbf{Nelder--Mead}: derivative-free, robust to non-smooth wrinkles (e.g. switching between integration branches), cheap per iteration but slow near the optimum (linear convergence at best). Multi-start mitigates the local-minimum problem. Best as a global stage.
+\item \textbf{Genetic}: handles strongly multi-modal landscapes (rare in Heston but possible with sparse data), no gradient, embarrassingly parallel in principle. The library's deterministic seed cannot be propagated without a custom \texttt{IRandomization}; for reproducibility the harness records the convergence trace.
+\item \textbf{BFGS}: super-linear local convergence when the gradient is well-defined. Transformed space avoids constraint handling at the cost of a curved metric. Vulnerable to large finite-difference noise from the integrand sum (mitigated by central differences and the smooth $f_j$).
+\item \textbf{L-BFGS-B}: same convergence as BFGS but in raw space, the right tool when the calibrator must honour business-defined parameter caps (e.g. risk-management bounds on $v_0$ or $\sigma$). The price is a slightly more delicate finite-difference stencil at the box edges.
+\end{itemize}
+The intended use is global $\to$ gradient chaining (\texttt{Chain = true}): use
+Nelder--Mead or GA to find a good basin, then refine with BFGS / L-BFGS-B.
+
+\subsection{Pipeline orchestration}
+\texttt{HestonCalibrator.Calibrate(CalibrationRequest, IVolatilitySurface, onProgress)}
+sequences the stages:
+\begin{enumerate}
+\item Build the dense $(T, K)$ sample grid from \texttt{surface.Expiries} $\times$ \texttt{surface.Strikes}.
+\item Construct a \texttt{VegaWeightedObjective}.
+\item Choose the global optimizer per \texttt{GlobalMethod} (\texttt{None}/\texttt{NelderMead}/\texttt{Genetic}).
+\item Choose the gradient optimizer per \texttt{GradientMethod} (\texttt{None}/\texttt{Bfgs}/\texttt{BfgsB}).
+\item If \texttt{Chain} is true (default), the gradient stage starts from the global stage's best;
+otherwise from the initial guess.
+\item Report convergence points through the \texttt{onProgress} callback (used by the SSE streaming endpoint).
+\item After convergence, evaluate market vs Heston implied-vol matrices on the same grid for diagnostics.
+\end{enumerate}
+Default bounds come from \texttt{CalibrationRequest}:
+$\kappa \in [0.01, 20]$, $\theta \in [10^{-4}, 1]$, $\sigma \in [0.01, 5]$,
+$\rho \in [-0.99, 0.99]$, $v_0 \in [10^{-4}, 1]$.
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator/Calibration/HestonCalibrator.cs} --- pipeline driver.
+\item \texttt{HestonVolCalibrator/Calibration/CalibrationContracts.cs} --- request/result records and enums.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Quote cleaning pipeline}
+\label{sec:cleaner}
+\texttt{QuoteCleaner.Clean} runs four sequential stages on the raw option chain.
+
+\paragraph{Stage 1 -- bid/ask sanity.} A quote is dropped if any of:
+\[
+\text{bid}\le 0,\ \text{ask}\le 0,\ \text{ask}<\text{bid},\ \text{bid} < \text{MinBid},\ \text{mid}\le 0,\ \frac{\text{ask} - \text{bid}}{\text{mid}} > \text{MaxRelSpread}.
+\]
+Defaults: \texttt{MinBid = 0.05}, \texttt{MaxRelSpread = 0.30}.
+
+\paragraph{Stage 2 -- no-arbitrage price bounds (per side).} Using $D(T), D_q(T)$ from
+curves:
+\begin{align*}
+\text{Call:} &\quad \max(S\, D_q - K\, D, 0)\;\le\;\text{mid}\;\le\;S\, D_q,\\
+\text{Put:}  &\quad \max(K\, D - S\, D_q, 0)\;\le\;\text{mid}\;\le\;K\, D.
+\end{align*}
+A small $\varepsilon = 0.01$ slack is allowed on each side.
+
+\paragraph{Stage 3 -- butterfly convexity in $K$ (per side, per maturity).}
+Sort by strike; for each interior triple $(K_-, K, K_+)$ the central second
+difference must satisfy
+\[
+C(K_+) - 2\,C(K) + C(K_-) \;\ge\; -\text{tol},
+\qquad \text{tol} = 0.05 \cdot \max_i C(K_i).
+\]
+Violating mid quotes are dropped. The sweep is repeated up to 5 times to allow
+chains of arbitrage violations to clear, and the neighbour of a removed point
+is skipped within a pass to prevent cascading false positives.
+
+\paragraph{Stage 4 -- MAD-based smile outlier rejection (per maturity).}
+For each maturity $T$ with at least 5 surviving quotes:
+\begin{enumerate}
+\item Compute IV $\sigma_i = $ \texttt{ImpliedVolSolver.Solve} for each surviving quote.
+\item Fit an OLS quadratic in log-moneyness
+$x_i = \ln(K_i / F_T)$ where $F_T = S\, D_q(T)/D(T)$:
+\[
+\sigma_i \;\approx\; a + b\, x_i + c\, x_i^2.
+\]
+\item Compute residuals $r_i = \sigma_i - (a + b x_i + c x_i^2)$, then
+\[
+\mathrm{MAD} = 1.4826 \cdot \mathrm{median}_i \big|r_i - \mathrm{median}(r)\big|.
+\]
+\item Drop any $i$ with $|r_i - \mathrm{median}(r)| > k\cdot\mathrm{MAD}$,
+default $k = $ \texttt{MadKSigma = 4.0}.
+\end{enumerate}
+The $1.4826$ factor makes MAD a consistent estimator of $\sigma$ under
+Gaussian residuals.
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator.DataLoader/QuoteCleaner.cs} --- all four stages and the helpers \texttt{TryFitQuadratic} (OLS via Cramer's rule) and \texttt{Median}.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Curve abstraction}
+The interfaces and implementations isolate discount, dividend, and forward
+curves from the rest of the codebase.
+\begin{itemize}
+\item \texttt{IDiscountCurve}: $D(t) = e^{-z(t)\, t}$, $z(t)$, and instantaneous forward $f(t) = -d \ln D/dt$.
+\item \texttt{IYieldCurve} extends \texttt{IDiscountCurve} with $q(t)$.
+\item \texttt{IForwardCurve}: $F(0,t) = S\, D_q(t)/D(t)$ and log-moneyness $\ln(K/F(0,t))$.
+\end{itemize}
+\texttt{FlatDiscountCurve}/\texttt{FlatYieldCurve} are constant-rate placeholders.
+\texttt{PiecewiseLinearZeroCurve} linearly interpolates the zero rate $z(t)$
+between strictly increasing pillar tenors and extrapolates flat outside.
+Its instantaneous forward uses
+\[
+f(t) = z(t) + t\, \frac{dz}{dt},
+\]
+approximated by a centered finite difference on $z$.
+
+\paragraph{Wiring note.} As of this writing the curve layer is consumed only by
+\texttt{QuoteCleaner} (no-arbitrage bounds and forward computation for MAD
+filtering). Pricing and calibration still take scalar \texttt{rate} and
+\texttt{dividendYield} parameters; lifting them to curves is a clean next step
+but is not yet done.
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator/Interfaces/IDiscountCurve.cs} --- interfaces and conventions.
+\item \texttt{HestonVolCalibrator/Implementations/Curves.cs} --- flat curves, piecewise-linear zero curve, \texttt{ForwardCurve}, \texttt{CurveFactory}.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Surface construction and service layer}
+\texttt{SurfaceBuilder.Build} converts an enumeration of \texttt{OptionQuote}
+into a \texttt{GridVolatilitySurface} of IVs. Quotes are first grouped by
+rounded maturity (4 decimals); within each maturity, for each strike the more
+liquid leg is kept (highest \texttt{OpenInterest + Volume}). Implied vol
+inversion runs through \texttt{ImpliedVolSolver}, after which valid
+$(T, K, \sigma, \text{IsCall})$ tuples are inserted into the grid.
+
+The web layer wraps this in a \texttt{SurfaceService} that caches surfaces by
+ticker so repeated calibration requests skip Yahoo fetches.
+\texttt{SyntheticSurface} produces a deterministic Heston-generated surface for
+sanity tests and demos.
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator.DataLoader/SurfaceBuilder.cs} --- builder, CSV export, console pretty-printer.
+\item \texttt{HestonVolCalibrator.Web/SurfaceService.cs} --- HTTP-layer surface cache.
+\item \texttt{HestonVolCalibrator.Web/SyntheticSurface.cs} --- synthetic Heston surface generator.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Web API and frontend (brief)}
+Minimal-API ASP.NET Core endpoints:
+\begin{itemize}
+\item \texttt{POST /api/surface} --- fetch quotes, clean, build the IV surface, return the (T, K, IV) grid and the matching call/put price grids.
+\item \texttt{POST /api/calibrate} --- run a full calibration synchronously and return the fitted parameters, RMSE, and IV grids.
+\item \texttt{POST /api/calibrate/stream} --- same as above but streams convergence points as Server-Sent Events.
+\item \texttt{POST /api/heston-surface} --- evaluate the Heston pricer for a user-supplied parameter set across a $(T, K)$ grid (no calibration).
+\item \texttt{GET /api/health} --- liveness probe.
+\end{itemize}
+The frontend is a single-page Plotly app under \texttt{wwwroot/} that renders the
+market and Heston IV surfaces side by side and animates the convergence trace
+in real time.
+
+\paragraph*{Implemented in}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator.Web/Program.cs} --- endpoint registration and SSE pumping.
+\item \texttt{HestonVolCalibrator.Web/Contracts.cs}, \texttt{JsonConverters.cs} --- request/response DTOs.
+\item \texttt{HestonVolCalibrator.Web/wwwroot/index.html} and \texttt{app.js} --- Plotly UI.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\section{Project layout}
+\begin{itemize}
+\item \texttt{HestonVolCalibrator/} --- model, pricer, calibration, curves. Pure library, no IO.
+\item \texttt{HestonVolCalibrator.DataLoader/} --- Yahoo options loader, implied-vol solver, quote cleaner, surface builder.
+\item \texttt{HestonVolCalibrator.Runner/} --- CLI entry point that wires DataLoader $\to$ Calibrator $\to$ console output.
+\item \texttt{HestonVolCalibrator.Web/} --- ASP.NET Core minimal-API service plus Plotly SPA.
+\item \texttt{HestonModel/} --- example/sandbox program.
+\end{itemize}
+
+\subsection*{End-to-end data flow}
+\begin{enumerate}
+\item \texttt{YahooOptionsLoader} fetches an option chain for a ticker and produces a list of \texttt{OptionQuote} records (bid, ask, last, OI, volume, maturity, strike, IsCall).
+\item \texttt{QuoteCleaner.Clean} filters quotes through the four stages of \S\ref{sec:cleaner}, returning the survivors and a per-reason drop-count diagnostic.
+\item \texttt{SurfaceBuilder.Build} inverts each surviving quote to IV (via \texttt{ImpliedVolSolver}) and assembles a \texttt{GridVolatilitySurface}, choosing the most liquid leg at each $(T, K)$ cell.
+\item \texttt{HestonCalibrator.Calibrate} consumes the surface and a \texttt{CalibrationRequest}, runs the global $\to$ gradient pipeline, and returns market and model IV grids alongside the fitted parameters and convergence trace.
+\item The web layer plots both grids and the trace in real time via SSE.
+\end{enumerate}
+
+\subsection*{Numerical-stability checks worth running}
+\begin{itemize}
+\item Increase $N$ or $\phi_{\max}$ in the pricer and verify convergence of $P_1, P_2$ to ${<}10^{-6}$ digit-stability for moderate maturities.
+\item Round-trip test: generate synthetic data from a known Heston parameter set, calibrate, and verify recovery within $10^{-3}$ on each parameter.
+\item Probe the Feller boundary: hand-set $\sigma$ near $\sqrt{2\kappa\theta}$ and check the pricer remains finite.
+\item Test the integrand sign (\S\ref{sec:cf}): if at-the-money the model-IV closely matches but deep-OTM diverges, the integrand is likely on the $\mathrm{Re}$ branch instead of $\mathrm{Im}$.
+\end{itemize}
+
+\end{document}

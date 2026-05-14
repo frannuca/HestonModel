@@ -1,0 +1,26 @@
+\contentsline {section}{\numberline {1}Preface and scope}{2}{section.1}%
+\contentsline {section}{\numberline {2}Notation and conventions}{2}{section.2}%
+\contentsline {section}{\numberline {3}Heston model dynamics}{2}{section.3}%
+\contentsline {section}{\numberline {4}Characteristic-function pricing}{3}{section.4}%
+\contentsline {subsection}{\numberline {4.1}Albrecher ``little trap'' characteristic function}{4}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Integration}{4}{subsection.4.2}%
+\contentsline {section}{\numberline {5}Implied volatility inversion}{4}{section.5}%
+\contentsline {section}{\numberline {6}Calibration objective}{5}{section.6}%
+\contentsline {section}{\numberline {7}Parameter transforms}{6}{section.7}%
+\contentsline {section}{\numberline {8}Optimization pipeline}{6}{section.8}%
+\contentsline {subsection}{\numberline {8.1}Nelder--Mead simplex}{6}{subsection.8.1}%
+\contentsline {subsection}{\numberline {8.2}Genetic algorithm}{7}{subsection.8.2}%
+\contentsline {subsection}{\numberline {8.3}BFGS (unconstrained, transformed space)}{7}{subsection.8.3}%
+\contentsline {subsection}{\numberline {8.4}L-BFGS-B (box-constrained, raw space)}{8}{subsection.8.4}%
+\contentsline {subsection}{\numberline {8.5}Comparison of the four optimizers}{8}{subsection.8.5}%
+\contentsline {subsection}{\numberline {8.6}Pipeline orchestration}{8}{subsection.8.6}%
+\contentsline {section}{\numberline {9}Quote cleaning pipeline}{9}{section.9}%
+\contentsline {paragraph}{Stage 1 -- bid/ask sanity.}{9}{section*.17}%
+\contentsline {paragraph}{Stage 2 -- no-arbitrage price bounds (per side).}{9}{section*.18}%
+\contentsline {paragraph}{Stage 3 -- butterfly convexity in $K$ (per side, per maturity).}{9}{section*.19}%
+\contentsline {paragraph}{Stage 4 -- MAD-based smile outlier rejection (per maturity).}{9}{section*.20}%
+\contentsline {section}{\numberline {10}Curve abstraction}{10}{section.10}%
+\contentsline {paragraph}{Wiring note.}{10}{section*.22}%
+\contentsline {section}{\numberline {11}Surface construction and service layer}{10}{section.11}%
+\contentsline {section}{\numberline {12}Web API and frontend (brief)}{11}{section.12}%
+\contentsline {section}{\numberline {13}Project layout}{11}{section.13}%

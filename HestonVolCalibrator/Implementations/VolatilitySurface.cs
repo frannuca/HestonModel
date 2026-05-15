@@ -10,6 +10,9 @@ namespace HestonVolCalibrator.Implementations
         private readonly Dictionary<(double maturity, double strike), double> _data = new();
         private readonly SortedSet<double> _maturities = new();
         private readonly SortedSet<double> _strikes = new();
+        
+        // Cache for interpolation to avoid repeated lookups
+        private (double maturity, double strike, double vol)? _lastQuery;
 
         public IReadOnlyList<double> Expiries => _maturities.ToArray();
         public IReadOnlyList<double> Strikes => _strikes.ToArray();
@@ -22,16 +25,26 @@ namespace HestonVolCalibrator.Implementations
             _data[(maturity, strike)] = vol;
             _maturities.Add(maturity);
             _strikes.Add(strike);
+            _lastQuery = null;  // Invalidate cache
         }
 
         public double GetVolByStrike(double spot, double strike, double maturity)
         {
+            // Quick cache check
+            if (_lastQuery?.maturity == maturity && _lastQuery?.strike == strike)
+                return _lastQuery.Value.vol;
+
             // Try exact match first
             if (_data.TryGetValue((maturity, strike), out var vol))
+            {
+                _lastQuery = (maturity, strike, vol);
                 return vol;
+            }
 
             // Bilinear interpolation
-            return InterpolateVol(strike, maturity);
+            vol = InterpolateVol(strike, maturity);
+            _lastQuery = (maturity, strike, vol);
+            return vol;
         }
 
         public double GetVolByDelta(double spot, double delta, double maturity)
@@ -127,4 +140,3 @@ namespace HestonVolCalibrator.Implementations
         }
     }
 }
-

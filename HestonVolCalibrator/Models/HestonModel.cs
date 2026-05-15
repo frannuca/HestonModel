@@ -5,11 +5,11 @@ namespace HestonVolCalibrator.Implementations
 {
     public sealed class HestonModelParams
     {
-        public double Kappa { get; set; }    // mean reversion speed
-        public double Theta { get; set; }    // long-run variance
-        public double Sigma { get; set; }    // vol of vol
-        public double Rho { get; set; }      // spot-variance correlation
-        public double V0 { get; set; }       // initial variance
+        public double Kappa { get; set; }
+        public double Theta { get; set; }
+        public double Sigma { get; set; }
+        public double Rho { get; set; }
+        public double V0 { get; set; }
 
         public HestonModelParams(double kappa, double theta, double sigma, double rho, double v0)
         {
@@ -25,27 +25,31 @@ namespace HestonVolCalibrator.Implementations
     }
 
     /// <summary>
-    /// Heston (1993) European option pricer using characteristic-function inversion.
+    /// Heston European option pricer using the Lewis/Gatheral single-integral representation.
     ///
-    /// Changes versus the original version:
-    /// - Keeps Simpson grid spacing bounded when NMax is hit by reducing phiMax instead of silently increasing h.
-    /// - Enforces a stable complex square-root branch with Re(d) >= 0.
-    /// - Uses the little-Heston-trap representation with a guard if |g| is numerically unsafe.
-    /// - Clamps probabilities and option prices to arbitrage bounds before implied-vol inversion.
-    /// - Uses robust BS implied-vol inversion with bisection fallback and low-vega protection.
+    /// This version avoids the more fragile P1/P2 probability inversion, which is a common source
+    /// of strike-by-strike oscillations in calibrated implied-volatility smiles.
     ///
-    /// This is still a semi-analytical Fourier pricer. For production calibration, compare against a
-    /// Gauss-Laguerre / Lewis-Gatheral implementation and validate monotonicity/convexity by strike.
+    /// Formula:
+    /// C = S exp(-qT) - sqrt(K) exp(-rT) / pi * integral_0^inf
+    ///     Re[ exp(-iu log K) * phi_X(u - i/2) / (u^2 + 1/4) ] du
+    /// where phi_X is the Heston characteristic function of log(S_T).
+    ///
+    /// Numerical method:
+    /// - Composite Gauss-Legendre integration over [0, IntegrationUpper].
+    /// - Stable Heston characteristic function with Re(d) >= 0.
+    /// - No reciprocal branch switching and no probability clamping.
+    /// - Final option price is only clamped to no-arbitrage bounds before IV inversion.
     /// </summary>
     public static class HestonPricer
     {
-        private const double TargetH = 0.025;
-        private const int NMax = 40_000;
-        private const double PhiMin = 1e-8;
-        private const double PhiMaxFloor = 75.0;
-        private const double PhiMaxCeil = 300.0;
         private const double MinVariance = 1e-12;
         private const double MinVolOfVol = 1e-10;
+
+        // Conservative defaults. Increase SegmentCount for very short maturities or extreme params.
+        private const int GaussOrder = 32;
+        private const int SegmentCount = 96;
+        private const double IntegrationUpper = 200.0;
 
         public static double CallPrice(
             HestonModelParams p,
@@ -65,8 +69,6 @@ namespace HestonVolCalibrator.Implementations
             if (maturity <= 0.0)
                 return intrinsic;
 
-            // Degenerate Heston limit: if vol-of-vol is almost zero, use Black-Scholes with variance
-            // close to the deterministic variance level. This avoids divisions by sigma^2.
             if (Math.Abs(p.Sigma) < MinVolOfVol)
             {
                 double effectiveVariance = IntegratedDeterministicVariance(p, maturity) / maturity;
@@ -74,11 +76,10 @@ namespace HestonVolCalibrator.Implementations
                 return BlackScholesCall(spot, strike, maturity, rate, dividendYield, vol);
             }
 
-            double prob1 = ComputeProb(p, spot, strike, maturity, rate, dividendYield, 1);
-            double prob2 = ComputeProb(p, spot, strike, maturity, rate, dividendYield, 2);
+            double integral = IntegrateLewis(p, spot, strike, maturity, rate, dividendYield);
+            double call = spot * dfq - Math.Sqrt(strike) * df * integral / Math.PI;
 
-            double price = spot * dfq * prob1 - strike * df * prob2;
-            return Clamp(price, intrinsic, upper);
+            return Clamp(call, intrinsic, upper);
         }
 
         public static double PutPrice(
@@ -110,73 +111,64 @@ namespace HestonVolCalibrator.Implementations
             return BsImpliedVol(price, spot, strike, maturity, rate, dividendYield);
         }
 
-        private static double ComputeProb(
+        private static double IntegrateLewis(
             HestonModelParams p,
             double spot,
             double strike,
             double maturity,
             double rate,
-            double dividendYield,
-            int probabilityIndex)
+            double dividendYield)
         {
+            GetGaussLegendreNodesAndWeights(GaussOrder, out double[] nodes, out double[] weights);
+
             double logK = Math.Log(strike);
-
-            // Avoid huge phiMax. Very large domains make Simpson integration noisy for dense strike grids.
-            double effectiveV0 = Math.Max(p.V0, 1e-4);
-            double phiMax = 120.0 / Math.Sqrt(Math.Max(maturity, 1e-6) * effectiveV0);
-            phiMax = Clamp(phiMax, PhiMaxFloor, PhiMaxCeil);
-
-            int n = (int)Math.Ceiling((phiMax - PhiMin) / TargetH);
-            if ((n & 1) == 1)
-                n++;
-
-            // Critical fix: if N is capped, also reduce phiMax so the actual h remains close to TargetH.
-            // The old implementation kept phiMax huge and silently coarsened h, producing oscillatory smiles.
-            if (n > NMax)
-            {
-                n = NMax;
-                if ((n & 1) == 1)
-                    n--;
-                phiMax = PhiMin + n * TargetH;
-            }
-
-            if (n < 2)
-                n = 2;
-
-            double h = (phiMax - PhiMin) / n;
+            double segmentWidth = IntegrationUpper / SegmentCount;
             double sum = 0.0;
 
-            for (int k = 0; k <= n; k++)
+            for (int s = 0; s < SegmentCount; s++)
             {
-                double phi = PhiMin + k * h;
-                Complex cf = CharFunc(p, spot, maturity, rate, dividendYield, probabilityIndex, phi);
+                double a = s * segmentWidth;
+                double b = a + segmentWidth;
+                double mid = 0.5 * (a + b);
+                double half = 0.5 * (b - a);
 
-                // Re[exp(-i phi logK) * cf / (i phi)] = Im[exp(-i phi logK) * cf] / phi
-                double angle = -phi * logK;
-                double rotatedImaginary = Math.Cos(angle) * cf.Imaginary + Math.Sin(angle) * cf.Real;
-                double integrand = rotatedImaginary / phi;
+                double segmentSum = 0.0;
 
-                if (double.IsNaN(integrand) || double.IsInfinity(integrand))
-                    continue;
+                for (int n = 0; n < GaussOrder; n++)
+                {
+                    double u = mid + half * nodes[n];
 
-                int weight = (k == 0 || k == n) ? 1 : ((k & 1) == 1 ? 4 : 2);
-                sum += weight * integrand;
+                    Complex shiftedU = new Complex(u, -0.5); // u - i/2
+                    Complex cf = LogSpotCharFunc(p, spot, maturity, rate, dividendYield, shiftedU);
+                    Complex oscillation = Complex.Exp(-Complex.ImaginaryOne * u * logK);
+                    Complex value = oscillation * cf / (u * u + 0.25);
+
+                    double integrand = value.Real;
+                    if (!double.IsNaN(integrand) && !double.IsInfinity(integrand))
+                        segmentSum += weights[n] * integrand;
+                }
+
+                sum += half * segmentSum;
             }
 
-            double probability = 0.5 + (h / 3.0) * sum / Math.PI;
-
-            // Small numerical violations of [0,1] can cause severe IV spikes.
-            return Clamp(probability, 0.0, 1.0);
+            if (Math.Abs(sum) < 1e-6)
+            {
+                var msg = "";
+            }
+            return sum;
         }
 
-        private static Complex CharFunc(
+        /// <summary>
+        /// Characteristic function of log(S_T) under the Heston model.
+        /// Accepts complex u because Lewis evaluates phi(u - i/2).
+        /// </summary>
+        private static Complex LogSpotCharFunc(
             HestonModelParams p,
             double spot,
             double maturity,
             double rate,
             double dividendYield,
-            int probabilityIndex,
-            double phi)
+            Complex u)
         {
             double kappa = p.Kappa;
             double theta = p.Theta;
@@ -184,58 +176,30 @@ namespace HestonVolCalibrator.Implementations
             double rho = p.Rho;
             double v0 = p.V0;
 
-            double u = probabilityIndex == 1 ? 0.5 : -0.5;
-            double b = probabilityIndex == 1 ? kappa - rho * sigma : kappa;
+            Complex iu = Complex.ImaginaryOne * u;
+            Complex alpha = kappa - rho * sigma * iu;
 
-            Complex iPhi = new Complex(0.0, phi);
-            Complex beta = b - rho * sigma * iPhi;
-            Complex dArg = beta * beta + sigma * sigma * (phi * phi - 2.0 * u * iPhi);
-            Complex d = Complex.Sqrt(dArg);
-
-            // Stable square-root branch. This helps prevent discontinuous phase jumps.
+            // d = sqrt((kappa - rho sigma i u)^2 + sigma^2 (u^2 + i u))
+            Complex d = Complex.Sqrt(alpha * alpha + sigma * sigma * (u * u + iu));
             if (d.Real < 0.0)
                 d = -d;
 
-            Complex g = (beta - d) / (beta + d);
+            Complex g = (alpha - d) / (alpha + d);
+            Complex expNegDt = Complex.Exp(-d * maturity);
 
-            // Little trap should generally have |g| < 1. If numerical round-off gives |g| > 1,
-            // use the reciprocal representation to avoid explosive exp/log terms.
-            bool useReciprocal = Complex.Abs(g) > 1.0;
+            Complex oneMinusG = 1.0 - g;
+            Complex oneMinusGExp = 1.0 - g * expNegDt;
 
-            Complex c;
-            Complex dCoef;
+            Complex logTerm = Complex.Log(oneMinusGExp / oneMinusG);
 
-            if (!useReciprocal)
-            {
-                Complex expNegDt = Complex.Exp(-d * maturity);
-                Complex oneMinusGExp = 1.0 - g * expNegDt;
-                Complex oneMinusG = 1.0 - g;
+            Complex c = iu * (Math.Log(spot) + (rate - dividendYield) * maturity)
+                      + kappa * theta / (sigma * sigma)
+                      * ((alpha - d) * maturity - 2.0 * logTerm);
 
-                Complex logFactor = Complex.Log(oneMinusGExp / oneMinusG);
+            Complex dCoef = (alpha - d) / (sigma * sigma)
+                          * (1.0 - expNegDt) / oneMinusGExp;
 
-                c = (rate - dividendYield) * iPhi * maturity
-                    + kappa * theta / (sigma * sigma) * ((beta - d) * maturity - 2.0 * logFactor);
-
-                dCoef = (beta - d) / (sigma * sigma) * (1.0 - expNegDt) / oneMinusGExp;
-            }
-            else
-            {
-                // Reciprocal formulation: use G = 1/g and exp(+dT). This is algebraically equivalent
-                // but more stable if |g| is numerically outside the unit circle.
-                Complex gInv = 1.0 / g;
-                Complex expDt = Complex.Exp(d * maturity);
-                Complex oneMinusGInvExp = 1.0 - gInv * expDt;
-                Complex oneMinusGInv = 1.0 - gInv;
-
-                Complex logFactor = Complex.Log(oneMinusGInvExp / oneMinusGInv);
-
-                c = (rate - dividendYield) * iPhi * maturity
-                    + kappa * theta / (sigma * sigma) * ((beta + d) * maturity - 2.0 * logFactor);
-
-                dCoef = (beta + d) / (sigma * sigma) * (1.0 - expDt) / oneMinusGInvExp;
-            }
-
-            return Complex.Exp(c + dCoef * v0 + iPhi * Math.Log(spot));
+            return Complex.Exp(c + dCoef * v0);
         }
 
         public static double BsImpliedVol(
@@ -259,12 +223,10 @@ namespace HestonVolCalibrator.Implementations
             double dfq = Math.Exp(-dividendYield * maturity);
             double intrinsic = Math.Max(spot * dfq - strike * df, 0.0);
             double upper = spot * dfq;
-
             price = Clamp(price, intrinsic, upper);
 
             if (price <= intrinsic + 1e-10)
                 return volLo;
-
             if (price >= upper - 1e-10)
                 return volHi;
 
@@ -297,7 +259,6 @@ namespace HestonVolCalibrator.Implementations
                 if (vega > 1e-10)
                 {
                     nextVol = vol - diff / vega;
-
                     if (double.IsNaN(nextVol) || double.IsInfinity(nextVol) || nextVol <= lo || nextVol >= hi)
                         nextVol = 0.5 * (lo + hi);
                 }
@@ -349,12 +310,10 @@ namespace HestonVolCalibrator.Implementations
             double rate,
             double dividendYield)
         {
+            double df = Math.Exp(-rate * maturity);
             double dfq = Math.Exp(-dividendYield * maturity);
-            double intrinsic = Math.Max(spot * dfq - strike * Math.Exp(-rate * maturity), 0.0);
+            double intrinsic = Math.Max(spot * dfq - strike * df, 0.0);
             double timeValue = Math.Max(price - intrinsic, 1e-12);
-
-            // Brenner-Subrahmanyam ATM-style guess. It is imperfect away from ATM but good enough
-            // because the solver is bracketed.
             return Math.Sqrt(2.0 * Math.PI / maturity) * timeValue / Math.Max(spot * dfq, 1e-12);
         }
 
@@ -363,41 +322,27 @@ namespace HestonVolCalibrator.Implementations
             if (Math.Abs(p.Kappa) < 1e-12)
                 return Math.Max(p.V0, MinVariance) * maturity;
 
-            // E[v_t] = theta + (v0 - theta) exp(-kappa t)
-            // integral_0^T E[v_t] dt = theta T + (v0 - theta)(1 - exp(-kappa T))/kappa
             return p.Theta * maturity + (p.V0 - p.Theta) * (1.0 - Math.Exp(-p.Kappa * maturity)) / p.Kappa;
         }
 
         private static void ValidateInputs(HestonModelParams p, double spot, double strike, double maturity)
         {
-            if (p == null)
-                throw new ArgumentNullException(nameof(p));
-            if (spot <= 0.0)
-                throw new ArgumentOutOfRangeException(nameof(spot), "Spot must be positive.");
-            if (strike <= 0.0)
-                throw new ArgumentOutOfRangeException(nameof(strike), "Strike must be positive.");
-            if (maturity < 0.0)
-                throw new ArgumentOutOfRangeException(nameof(maturity), "Maturity cannot be negative.");
-            if (p.Kappa <= 0.0)
-                throw new ArgumentOutOfRangeException(nameof(p.Kappa), "Kappa must be positive.");
-            if (p.Theta <= 0.0)
-                throw new ArgumentOutOfRangeException(nameof(p.Theta), "Theta must be positive.");
-            if (p.Sigma < 0.0)
-                throw new ArgumentOutOfRangeException(nameof(p.Sigma), "Sigma cannot be negative.");
-            if (p.Rho <= -1.0 || p.Rho >= 1.0)
-                throw new ArgumentOutOfRangeException(nameof(p.Rho), "Rho must be strictly between -1 and 1.");
-            if (p.V0 <= 0.0)
-                throw new ArgumentOutOfRangeException(nameof(p.V0), "V0 must be positive.");
+            if (p == null) throw new ArgumentNullException(nameof(p));
+            if (spot <= 0.0) throw new ArgumentOutOfRangeException(nameof(spot), "Spot must be positive.");
+            if (strike <= 0.0) throw new ArgumentOutOfRangeException(nameof(strike), "Strike must be positive.");
+            if (maturity < 0.0) throw new ArgumentOutOfRangeException(nameof(maturity), "Maturity cannot be negative.");
+            if (p.Kappa <= 0.0) throw new ArgumentOutOfRangeException(nameof(p.Kappa), "Kappa must be positive.");
+            if (p.Theta <= 0.0) throw new ArgumentOutOfRangeException(nameof(p.Theta), "Theta must be positive.");
+            if (p.Sigma < 0.0) throw new ArgumentOutOfRangeException(nameof(p.Sigma), "Sigma cannot be negative.");
+            if (p.Rho <= -1.0 || p.Rho >= 1.0) throw new ArgumentOutOfRangeException(nameof(p.Rho), "Rho must be strictly between -1 and 1.");
+            if (p.V0 <= 0.0) throw new ArgumentOutOfRangeException(nameof(p.V0), "V0 must be positive.");
         }
 
-        private static double NormalPdf(double x)
-        {
-            return Math.Exp(-0.5 * x * x) / Math.Sqrt(2.0 * Math.PI);
-        }
+        private static double NormalPdf(double x) =>
+            Math.Exp(-0.5 * x * x) / Math.Sqrt(2.0 * Math.PI);
 
         private static double NormalCdf(double x)
         {
-            // Abramowitz-Stegun approximation. Max absolute error around 7.5e-8.
             double sign = x < 0.0 ? -1.0 : 1.0;
             double z = Math.Abs(x) / Math.Sqrt(2.0);
             double t = 1.0 / (1.0 + 0.3275911 * z);
@@ -414,6 +359,46 @@ namespace HestonVolCalibrator.Implementations
             if (value > max) return max;
             return value;
 #endif
+        }
+
+        private static void GetGaussLegendreNodesAndWeights(int order, out double[] nodes, out double[] weights)
+        {
+            nodes = new double[order];
+            weights = new double[order];
+
+            const double eps = 1e-15;
+            int m = (order + 1) / 2;
+
+            for (int i = 0; i < m; i++)
+            {
+                double z = Math.Cos(Math.PI * (i + 0.75) / (order + 0.5));
+                double z1;
+                double p1 = 0.0;
+                double p2 = 0.0;
+                double pp = 0.0;
+
+                do
+                {
+                    p1 = 1.0;
+                    p2 = 0.0;
+                    for (int j = 1; j <= order; j++)
+                    {
+                        double p3 = p2;
+                        p2 = p1;
+                        p1 = ((2.0 * j - 1.0) * z * p2 - (j - 1.0) * p3) / j;
+                    }
+
+                    pp = order * (z * p1 - p2) / (z * z - 1.0);
+                    z1 = z;
+                    z = z1 - p1 / pp;
+                }
+                while (Math.Abs(z - z1) > eps);
+
+                nodes[i] = -z;
+                nodes[order - 1 - i] = z;
+                weights[i] = 2.0 / ((1.0 - z * z) * pp * pp);
+                weights[order - 1 - i] = weights[i];
+            }
         }
     }
 }

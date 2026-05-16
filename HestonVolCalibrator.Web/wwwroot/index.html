@@ -182,6 +182,7 @@
       <button class="tab-btn" data-tab="comparison">Comparison</button>
       <button class="tab-btn" data-tab="smiles">Smiles</button>
       <button class="tab-btn" data-tab="convergence">Convergence</button>
+      <button class="tab-btn" data-tab="greeks">Greeks</button>
       <button class="tab-btn" data-tab="results">Results</button>
     </div>
 
@@ -253,6 +254,69 @@
     </div>
     <div class="tab-panel" id="tab-convergence">
       <div id="plot-convergence" class="plot"></div>
+    </div>
+    <div class="tab-panel" id="tab-greeks">
+      <div class="control-row">
+        <div class="control market-qty-group">
+          <label>Quantity</label>
+          <div class="qty-toggles">
+            <label class="mode-toggle"><input type="radio" name="greekQty" value="delta" checked /> Delta</label>
+            <label class="mode-toggle"><input type="radio" name="greekQty" value="gamma" /> Gamma</label>
+            <label class="mode-toggle"><input type="radio" name="greekQty" value="vega" /> Vega</label>
+            <label class="mode-toggle"><input type="radio" name="greekQty" value="theta" /> Theta</label>
+            <label class="mode-toggle"><input type="radio" name="greekQty" value="rho" /> Rho</label>
+          </div>
+        </div>
+      </div>
+      <div class="control-row">
+        <div class="control">
+          <label for="greekKmin">Min strike</label>
+          <input id="greekKmin" type="number" step="1" />
+        </div>
+        <div class="control">
+          <label for="greekKmax">Max strike</label>
+          <input id="greekKmax" type="number" step="1" />
+        </div>
+        <div class="control">
+          <label for="greekStrikes">Strike count</label>
+          <input id="greekStrikes" type="number" value="41" min="2" max="401" />
+        </div>
+        <div class="control">
+          <label for="greekTmin">Min T (yr)</label>
+          <input id="greekTmin" type="number" step="0.01" min="0.001" />
+        </div>
+        <div class="control">
+          <label for="greekTmax">Max T (yr)</label>
+          <input id="greekTmax" type="number" step="0.01" min="0.001" />
+        </div>
+        <div class="control">
+          <label for="greekMats">Maturity count</label>
+          <input id="greekMats" type="number" value="25" min="2" max="201" />
+        </div>
+        <div class="control">
+          <button id="useCalibRangeBtn" class="ghost" type="button">Use calibration range</button>
+        </div>
+        <div class="control">
+          <button id="computeGreeksBtn" class="primary" type="button">Compute Greeks</button>
+          <button id="cancelGreeksBtn" class="danger hidden" type="button">Cancel</button>
+        </div>
+        <div id="greeksStatus" class="status-pill"></div>
+      </div>
+      <div id="greeksProgressWrap" class="progress-wrap hidden">
+        <div class="progress-bar"><div id="greeksProgressFill" class="progress-fill"></div></div>
+        <div id="greeksProgressText" class="progress-text">—</div>
+      </div>
+      <div id="plot-greeks" class="plot"></div>
+      <div class="greeks-table-block">
+        <div class="greeks-table-header">
+          <h3 id="greeksTableTitle">Greek values</h3>
+          <label class="mode-toggle">
+            <input id="greeksTableShow" type="checkbox" checked /> Show table
+          </label>
+          <button id="greeksTableCsvBtn" class="ghost" type="button">Download CSV</button>
+        </div>
+        <div id="greeksTableWrap" class="greeks-table-wrap"></div>
+      </div>
     </div>
     <div class="tab-panel" id="tab-results">
       <div class="results-summary">

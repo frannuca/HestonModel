@@ -512,5 +512,102 @@ namespace HestonVolCalibrator.Implementations
                 weights[order - 1 - i] = weights[i];
             }
         }
+
+        // Heston Greeks calculations
+        public static double CallDelta(
+            HestonModelParams p,
+            double spot,
+            double strike,
+            double maturity,
+            double rate = 0.0,
+            double dividendYield = 0.0)
+        {
+            // This uses the complex integration approach from Heston model
+            // Return numerical approximation by finite differences on the call price
+            const double eps = 1e-4;
+            double pricePlus = CallPrice(p, spot + eps, strike, maturity, rate, dividendYield);
+            double priceMinus = CallPrice(p, spot - eps, strike, maturity, rate, dividendYield);
+            return (pricePlus - priceMinus) / (2 * eps);
+        }
+
+        public static double PutDelta(
+            HestonModelParams p,
+            double spot,
+            double strike,
+            double maturity,
+            double rate = 0.0,
+            double dividendYield = 0.0)
+        {
+            return CallDelta(p, spot, strike, maturity, rate, dividendYield) - 1.0;
+        }
+
+        public static double Gamma(
+            HestonModelParams p,
+            double spot,
+            double strike,
+            double maturity,
+            double rate = 0.0,
+            double dividendYield = 0.0)
+        {
+            // Return numerical approximation by finite differences on the delta
+            const double eps = 1e-4;
+            double deltaPlus = CallDelta(p, spot + eps, strike, maturity, rate, dividendYield);
+            double deltaMinus = CallDelta(p, spot - eps, strike, maturity, rate, dividendYield);
+            return (deltaPlus - deltaMinus) / (2 * eps);
+        }
+
+        public static double Vega(
+            HestonModelParams p,
+            double spot,
+            double strike,
+            double maturity,
+            double rate = 0.0,
+            double dividendYield = 0.0)
+        {
+            // Return numerical approximation by finite differences on the implied volatility
+            const double eps = 1e-4;
+            double ivPlus = ImpliedVol(p, spot, strike, maturity, rate, dividendYield);
+            // We need to adjust the volatility parameter for Vega calculation
+            // Since there's no direct way to compute Vega for Heston, 
+            // we'll use finite differences on the implied vol
+            var pPlus = new HestonModelParams(p.Kappa, p.Theta, p.Sigma + eps, p.Rho, p.V0);
+            double ivMinus = ImpliedVol(pPlus, spot, strike, maturity, rate, dividendYield);
+            return (ivPlus - ivMinus) / eps;  // Note: this approximation is rough
+        }
+
+        public static double Theta(
+            HestonModelParams p,
+            double spot,
+            double strike,
+            double maturity,
+            double rate = 0.0,
+            double dividendYield = 0.0)
+        {
+            const double eps = 1.0 / 365.0;
+            if (maturity <= eps)
+            {
+                double price = CallPrice(p, spot, strike, maturity, rate, dividendYield);
+                double priceNext = CallPrice(p, spot, strike, maturity + eps, rate, dividendYield);
+                return -(priceNext - price) / eps;
+            }
+            double pricePlus = CallPrice(p, spot, strike, maturity + eps, rate, dividendYield);
+            double priceMinus = CallPrice(p, spot, strike, maturity - eps, rate, dividendYield);
+            return -(pricePlus - priceMinus) / (2.0 * eps);
+        }
+
+        public static double Rho(
+            HestonModelParams p,
+            double spot,
+            double strike,
+            double maturity,
+            double rate = 0.0,
+            double dividendYield = 0.0)
+        {
+            // Return numerical approximation by finite differences on the price
+            const double eps = 1e-4;
+            double pricePlus = CallPrice(p, spot, strike, maturity, rate + eps, dividendYield);
+            double priceMinus = CallPrice(p, spot, strike, maturity, rate - eps, dividendYield);
+            return (pricePlus - priceMinus) / (2 * eps);
+        }
     }
 }

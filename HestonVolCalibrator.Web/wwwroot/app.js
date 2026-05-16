@@ -15,6 +15,9 @@ const state = {
     rendered: false,    // whether the user has clicked Plot at least once with current surface
     lastKey: null,      // last cache key used (for auto-rerender after calibration)
   },
+  // Last response from /api/heston-surface-with-greeks. Holds Greek 2D grids keyed by name
+  // so the tab can swap visualisation between delta/gamma/vega/theta/rho without refetching.
+  greeks: null,
 };
 
 // Color palette shared across tabs.
@@ -469,6 +472,7 @@ async function runCalibration() {
     }
     if (!result) throw new Error("No final result returned.");
     state.calibration = result;
+    applyCalibRangeToGreekInputs();
     const cappedStages = (result.stages || []).filter(s => s && s.converged === false);
     const convergedFlag = result.converged === false || cappedStages.length > 0;
     const baseMsg = `RMSE=${fmt(result.finalRmse, 6)} · iter=${result.totalIterations} · ${result.elapsedMs?.toFixed(0)}ms`;
@@ -1115,6 +1119,362 @@ async function plotInterpolatedHestonSurface() {
   }
 }
 
+// ───────────────── Greeks ─────────────────
+// Display style per Greek so the user gets useful axis labels and colour ramps.
+const GREEK_META = {
+  delta: { label: "Delta", colorscale: "RdBu",    title: "Heston Delta" },
+  gamma: { label: "Gamma", colorscale: "Viridis", title: "Heston Gamma" },
+  vega:  { label: "Vega",  colorscale: "Cividis", title: "Heston Vega"  },
+  theta: { label: "Theta", colorscale: "Magma",   title: "Heston Theta" },
+  rho:   { label: "Rho",   colorscale: "Plasma",  title: "Heston Rho"   },
+};
+
+function selectedGreek() {
+  return document.querySelector('input[name="greekQty"]:checked')?.value || "delta";
+}
+
+// Progress-bar helpers. Throttle the DOM update to once per animation frame so an SSE
+// stream firing every few ms doesn't thrash layout — the latest frame wins.
+let _greeksProgressPending = null;
+let _greeksRafId = 0;
+function updateGreeksProgress(frame, nt, nk) {
+  _greeksProgressPending = { frame, nt, nk };
+  if (_greeksRafId) return;
+  _greeksRafId = requestAnimationFrame(() => {
+    _greeksRafId = 0;
+    const { frame: f, nt: NT, nk: NK } = _greeksProgressPending || {};
+    if (!f) return;
+    const pct = f.total > 0 ? (100 * f.iter / f.total) : 0;
+    const fill = $("greeksProgressFill");
+    const text = $("greeksProgressText");
+    if (fill) fill.style.width = pct.toFixed(1) + "%";
+    if (text) {
+      const exp = (typeof f.expiry === "number") ? f.expiry.toFixed(4) : "?";
+      const strk = (typeof f.strike === "number") ? f.strike.toFixed(2) : "?";
+      text.textContent =
+        `${f.iter}/${f.total} (${pct.toFixed(1)}%) · ` +
+        `expiry ${f.expiryIdx + 1}/${NT} (T=${exp}y) · ` +
+        `strike ${f.strikeIdx + 1}/${NK} (K=${strk})`;
+    }
+  });
+}
+function showGreeksProgress(show) {
+  $("greeksProgressWrap")?.classList.toggle("hidden", !show);
+  if (!show && $("greeksProgressFill")) $("greeksProgressFill").style.width = "0%";
+}
+
+// Pull the (Kmin, Kmax, Tmin, Tmax, nK, nT) inputs from the Greeks controls. Falls back
+// to the calibration's natural range when a box is left blank.
+function readGreekRange() {
+  const c = state.calibration;
+  const calibKmin = c ? Math.min(...c.strikes) : 0;
+  const calibKmax = c ? Math.max(...c.strikes) : 0;
+  const calibTmin = c ? Math.min(...c.expiries) : 0;
+  const calibTmax = c ? Math.max(...c.expiries) : 0;
+  const parseOr = (id, fallback) => {
+    const v = parseFloat($(id).value);
+    return Number.isFinite(v) ? v : fallback;
+  };
+  return {
+    kmin: parseOr("greekKmin", calibKmin),
+    kmax: parseOr("greekKmax", calibKmax),
+    tmin: parseOr("greekTmin", calibTmin),
+    tmax: parseOr("greekTmax", calibTmax),
+    nk: Math.max(2, parseInt($("greekStrikes").value, 10) || 41),
+    nt: Math.max(2, parseInt($("greekMats").value, 10) || 25),
+  };
+}
+
+// Pre-fills the (K, T) range boxes from the current calibration so the user sees what
+// the default span would be. Called after a calibration completes / a snapshot is loaded
+// and when the user clicks "Use calibration range".
+function applyCalibRangeToGreekInputs() {
+  const c = state.calibration;
+  if (!c) return;
+  const kmin = Math.min(...c.strikes), kmax = Math.max(...c.strikes);
+  const tmin = Math.min(...c.expiries), tmax = Math.max(...c.expiries);
+  $("greekKmin").value = kmin.toFixed(2);
+  $("greekKmax").value = kmax.toFixed(2);
+  $("greekTmin").value = tmin.toFixed(4);
+  $("greekTmax").value = tmax.toFixed(4);
+}
+
+async function computeGreeksGrid() {
+  clearError();
+  if (!state.calibration) {
+    showError("Run or load a calibration first — Greeks are computed from the fitted Heston parameters.");
+    return;
+  }
+  const c = state.calibration;
+  const cparams = c.hestonParams || c.params;
+  const r = readGreekRange();
+  if (!(r.kmax > r.kmin) || !(r.tmax > r.tmin)) {
+    showError("Strike/maturity range invalid — max must exceed min.");
+    return;
+  }
+  const { nk, nt } = r;
+  const strikes = linspace(r.kmin, r.kmax, nk);
+  const maturities = linspace(r.tmin, r.tmax, nt);
+
+  setStatus("greeksStatus", "Streaming…", "busy");
+  $("computeGreeksBtn").disabled = true;
+  $("cancelGreeksBtn").classList.remove("hidden");
+  showGreeksProgress(true);
+  updateGreeksProgress({ iter: 0, total: nt * nk, expiryIdx: 0, strikeIdx: 0, expiry: 0, strike: 0 }, nt, nk);
+  log("info", "greeks", `stream ${nk}×${nt} grid (${nk*nt} cells) for ticker=${state.surface?.ticker || "?"}`);
+
+  const controller = new AbortController();
+  state.greeksAbort = controller;
+
+  const body = {
+    params: cparams,
+    spot: state.surface.spot,
+    riskFreeRate: surfaceRiskFreeRate(),
+    dividendYield: surfaceDividendYield(),
+    strikes,
+    maturities,
+  };
+
+  try {
+    const final = await streamGreeks(body, controller.signal, (frame) =>
+      updateGreeksProgress(frame, nt, nk));
+    if (!final) throw new Error("Stream closed without a final frame.");
+    state.greeks = {
+      strikes, maturities,
+      iv: final.iv,
+      delta: final.delta, gamma: final.gamma, vega: final.vega, theta: final.theta, rho: final.rho,
+      computedAt: Date.now(),
+    };
+    setStatus("greeksStatus", "Done", "ok");
+    log("ok", "greeks", `received full grid ${nk}×${nt}`);
+    renderGreeksSurface();
+  } catch (e) {
+    if (e.name === "AbortError") {
+      setStatus("greeksStatus", "Cancelled", "err");
+      log("warn", "greeks", "cancelled by user");
+    } else {
+      setStatus("greeksStatus", "Failed", "err");
+      showError("Greeks compute failed: " + e.message);
+      log("err", "greeks", e.message);
+    }
+  } finally {
+    $("computeGreeksBtn").disabled = false;
+    $("cancelGreeksBtn").classList.add("hidden");
+    state.greeksAbort = null;
+    // Leave the bar at 100% so the user can see the final state — clears on next run.
+  }
+}
+
+function cancelGreeksCompute() {
+  state.greeksAbort?.abort();
+}
+
+// SSE-over-POST stream parser for /api/heston-surface-with-greeks/stream.
+// Mirrors apiStreamCalibrate's shape but with progress / done / error event types specific
+// to this endpoint. Returns the parsed 'done' payload when the stream completes.
+async function streamGreeks(body, signal, onProgress) {
+  const t0 = performance.now();
+  const res = await fetch(API + "/api/heston-surface-with-greeks/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    const txt = await res.text().catch(() => "");
+    log("err", "sse", `${res.status} ${res.statusText}: ${txt.slice(0, 200)}`);
+    throw new Error(`${res.status} ${res.statusText}: ${txt}`);
+  }
+  log("ok", "sse", `greeks stream connected`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let finalResult = null;
+  let progressCount = 0;
+  let lastLogAt = 0;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const raw = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+
+      let event = "message";
+      const dataLines = [];
+      for (const line of raw.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+      }
+      if (dataLines.length === 0) continue;
+      let payload;
+      try { payload = JSON.parse(dataLines.join("\n")); }
+      catch (e) { log("err", "sse", `parse failed: ${e.message}`); continue; }
+
+      if (event === "started") {
+        log("info", "greeks", `started: ${payload.total} cells (${payload.expiries}×${payload.strikes})`);
+      } else if (event === "progress") {
+        progressCount++;
+        onProgress(payload);
+        // Throttle activity-log entries to ~4/sec; the progress bar already shows every frame.
+        const now = performance.now();
+        if (now - lastLogAt > 250) {
+          lastLogAt = now;
+          log("event", `cell ${payload.iter}/${payload.total}`,
+            `T=${payload.expiry?.toFixed(4)} K=${payload.strike?.toFixed(2)} δ=${payload.delta?.toFixed ? payload.delta.toFixed(4) : payload.delta}`);
+        }
+      } else if (event === "done") {
+        finalResult = payload;
+        log("ok", "sse", `done (${progressCount} cells, ${(performance.now() - t0).toFixed(0)}ms)`);
+      } else if (event === "error") {
+        const msg = payload?.message || "Greeks compute failed.";
+        log("err", "sse", `server error: ${msg}`);
+        throw new Error(msg);
+      }
+    }
+  }
+  return finalResult;
+}
+
+function renderGreeksSurface() {
+  if (!state.greeks) {
+    log("warn", "greeks", "renderGreeksSurface called with no cached data");
+    Plotly.purge("plot-greeks");
+    return;
+  }
+  const which = selectedGreek();
+  const meta = GREEK_META[which];
+  const z = state.greeks[which];
+  if (!z) {
+    log("err", "greeks", `field "${which}" missing — server may not have computed it (includeGreeks=false?)`);
+    showError(`Greek "${which}" missing from response.`);
+    return;
+  }
+  // Diagnostic: count non-null cells and report a sample to the activity log so the user
+  // can confirm data is being received even if the 3D plot fails to render visibly.
+  let nValid = 0, total = 0, sample = null;
+  for (const row of z) {
+    for (const v of row) {
+      total++;
+      if (v !== null && Number.isFinite(v)) {
+        nValid++;
+        if (sample === null) sample = v;
+      }
+    }
+  }
+  log("info", "greeks", `render ${which}: ${nValid}/${total} valid, sample=${sample?.toExponential ? sample.toExponential(3) : sample}`);
+
+  const layout = baseLayout3D(meta.title);
+  if (layout.scene) layout.scene.zaxis = { ...layout.scene.zaxis, title: meta.label };
+
+  const data = [{
+    type: "surface",
+    x: state.greeks.strikes,
+    y: state.greeks.maturities,
+    z,
+    connectgaps: true,
+    colorscale: meta.colorscale,
+    colorbar: { title: meta.label, thickness: 12 },
+  }];
+  Plotly.react("plot-greeks", data, layout, { responsive: true, displaylogo: false });
+  // Plotly 3D plots that are created while the tab is hidden can end up with a 0-width
+  // canvas. Force a resize on the next animation frame so the WebGL context picks up the
+  // visible container size.
+  requestAnimationFrame(() => {
+    const el = document.getElementById("plot-greeks");
+    if (el && el.offsetWidth > 0) Plotly.Plots.resize(el);
+  });
+  renderGreeksTable();
+}
+
+// Format a Greek value for the table. Tight precision rules so the columns line up:
+// near-integer values get fewer decimals, very small values use exponential form,
+// nulls render as an em-dash.
+function fmtGreek(v) {
+  if (v === null || v === undefined) return "—";
+  if (!Number.isFinite(v)) return "NaN";
+  const a = Math.abs(v);
+  if (a === 0) return "0";
+  if (a >= 1000 || a < 1e-3) return v.toExponential(3);
+  if (a >= 10) return v.toFixed(3);
+  if (a >= 1) return v.toFixed(4);
+  return v.toFixed(5);
+}
+
+// Render the currently-selected Greek as a (T × K) table. Headers are sticky on both axes
+// so the user can scroll a 25 × 41 grid without losing context.
+function renderGreeksTable() {
+  const wrap = $("greeksTableWrap");
+  if (!wrap) return;
+  if (!state.greeks) { wrap.innerHTML = ""; return; }
+
+  const show = $("greeksTableShow")?.checked ?? true;
+  wrap.classList.toggle("hidden", !show);
+  if (!show) return;
+
+  const which = selectedGreek();
+  const meta = GREEK_META[which];
+  $("greeksTableTitle").textContent = `${meta.label} table (rows = maturity, cols = strike)`;
+
+  const z = state.greeks[which];
+  if (!z) { wrap.innerHTML = ""; return; }
+
+  const strikes = state.greeks.strikes;
+  const maturities = state.greeks.maturities;
+
+  // Build the table HTML in one string concat — DOM-construction APIs are noticeably
+  // slower for 25×41 = 1025 cells on first render.
+  const parts = ['<table class="greeks-table"><thead><tr><th>T \\ K</th>'];
+  for (const k of strikes) parts.push(`<th>${k.toFixed(2)}</th>`);
+  parts.push("</tr></thead><tbody>");
+  for (let i = 0; i < maturities.length; i++) {
+    parts.push(`<tr><th>${maturities[i].toFixed(4)}</th>`);
+    const row = z[i] || [];
+    for (let j = 0; j < strikes.length; j++) {
+      const v = row[j];
+      const cls = v === null || v === undefined || !Number.isFinite(v) ? ' class="null-cell"' : "";
+      parts.push(`<td${cls}>${fmtGreek(v)}</td>`);
+    }
+    parts.push("</tr>");
+  }
+  parts.push("</tbody></table>");
+  wrap.innerHTML = parts.join("");
+}
+
+// Download the current Greek grid as CSV. Maturities go down rows, strikes across columns.
+// NaN/null cells become empty cells so spreadsheets show blanks rather than literal "NaN".
+function downloadGreekCsv() {
+  if (!state.greeks) { showError("Compute Greeks first."); return; }
+  const which = selectedGreek();
+  const z = state.greeks[which];
+  if (!z) { showError(`Greek "${which}" missing.`); return; }
+  const strikes = state.greeks.strikes;
+  const maturities = state.greeks.maturities;
+  const rows = [["T\\K", ...strikes.map(k => k.toFixed(4))].join(",")];
+  for (let i = 0; i < maturities.length; i++) {
+    const row = z[i] || [];
+    const cells = [maturities[i].toFixed(6)];
+    for (let j = 0; j < strikes.length; j++) {
+      const v = row[j];
+      cells.push(v === null || v === undefined || !Number.isFinite(v) ? "" : String(v));
+    }
+    rows.push(cells.join(","));
+  }
+  const csv = rows.join("\n") + "\n";
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const t = state.surface?.ticker || "snapshot";
+  const safe = String(t).toLowerCase().replace(/[^a-z0-9.-]+/g, "_");
+  a.href = url; a.download = `heston-${safe}-${which}.csv`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  log("ok", "greeks", `csv exported (${which}, ${maturities.length}×${strikes.length})`);
+}
+
 // Rates the loaded surface was built with — the calibrator and any post-fit Heston pricing
 // must use the same values, otherwise the model and market IVs sit on different forward curves.
 function surfaceRiskFreeRate() {
@@ -1476,6 +1836,7 @@ function hydrateFromSnapshot(snap) {
       history: c.history || [],
     };
     const result = state.calibration;
+    applyCalibRangeToGreekInputs();
     plotConvergenceFromHistory(result.history);
     renderHestonSurface(result);
     renderComparison(result);
@@ -1531,6 +1892,16 @@ function wireUi() {
     const hidden = body.classList.toggle("hidden");
     $("toggleCalibBtn").textContent = hidden ? "Expand" : "Collapse";
   });
+
+  // Greeks tab.
+  $("computeGreeksBtn").addEventListener("click", computeGreeksGrid);
+  $("cancelGreeksBtn").addEventListener("click", cancelGreeksCompute);
+  $("useCalibRangeBtn").addEventListener("click", applyCalibRangeToGreekInputs);
+  $("greeksTableShow")?.addEventListener("change", renderGreeksTable);
+  $("greeksTableCsvBtn")?.addEventListener("click", downloadGreekCsv);
+  for (const r of $$('input[name="greekQty"]')) {
+    r.addEventListener("change", () => renderGreeksSurface());
+  }
 
   // Snapshot panel wiring.
   $("saveSnapshotFileBtn").addEventListener("click", saveSnapshotToFile);

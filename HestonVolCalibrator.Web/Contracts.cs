@@ -55,4 +55,12 @@ public record HestonSurfaceRequest(
 
 public record HestonSurfaceResponse(double[][] Iv);
 
+public record HestonSurfaceResponseWithGreeks(
+    double[][] Iv,
+    double?[][]? Delta = null,
+    double?[][]? Gamma = null,
+    double?[][]? Vega = null,
+    double?[][]? Theta = null,
+    double?[][]? Rho = null);
+
 public record SaveSnapshotRequest(string Name, Snapshot Snapshot);

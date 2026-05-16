@@ -232,6 +232,201 @@ app.MapPost("/api/heston-surface", (HestonSurfaceRequest req) =>
     return Results.Ok(new HestonSurfaceResponse(iv));
 });
 
+// ───────────────── /api/heston-surface-with-greeks ─────────────────
+// IV plus first-order Greeks (delta, gamma, vega, theta, rho) on the (maturity, strike) grid.
+// `includeGreeks` is a query flag — when false the Greek arrays come back as null so the wire
+// payload is the same size as /api/heston-surface (callers that don't need them skip a lot of
+// pricer math). Each cell is independent: any failure NaNs the IV and nulls the Greeks for that
+// cell without aborting the rest of the grid.
+app.MapPost("/api/heston-surface-with-greeks", (HestonSurfaceRequest req, bool includeGreeks = true) =>
+{
+    var p = new HestonModelParams(req.Params.Kappa, req.Params.Theta, req.Params.Sigma, req.Params.Rho, req.Params.V0);
+    int nT = req.Maturities.Length;
+    int nK = req.Strikes.Length;
+
+    var iv = new double[nT][];
+    double?[][]? delta = null, gamma = null, vega = null, theta = null, rho = null;
+    if (includeGreeks)
+    {
+        delta = new double?[nT][];
+        gamma = new double?[nT][];
+        vega  = new double?[nT][];
+        theta = new double?[nT][];
+        rho   = new double?[nT][];
+    }
+
+    for (int i = 0; i < nT; i++)
+    {
+        iv[i] = new double[nK];
+        if (includeGreeks)
+        {
+            delta![i] = new double?[nK];
+            gamma![i] = new double?[nK];
+            vega![i]  = new double?[nK];
+            theta![i] = new double?[nK];
+            rho![i]   = new double?[nK];
+        }
+        double t = req.Maturities[i];
+        for (int j = 0; j < nK; j++)
+        {
+            double k = req.Strikes[j];
+            try
+            {
+                iv[i][j] = HestonPricer.ImpliedVol(p, req.Spot, k, t, req.RiskFreeRate, req.DividendYield);
+                if (includeGreeks)
+                {
+                    delta![i][j] = HestonPricer.CallDelta(p, req.Spot, k, t, req.RiskFreeRate, req.DividendYield);
+                    gamma![i][j] = HestonPricer.Gamma   (p, req.Spot, k, t, req.RiskFreeRate, req.DividendYield);
+                    vega![i][j]  = HestonPricer.Vega    (p, req.Spot, k, t, req.RiskFreeRate, req.DividendYield);
+                    theta![i][j] = HestonPricer.Theta   (p, req.Spot, k, t, req.RiskFreeRate, req.DividendYield);
+                    rho![i][j]   = HestonPricer.Rho     (p, req.Spot, k, t, req.RiskFreeRate, req.DividendYield);
+                }
+            }
+            catch
+            {
+                iv[i][j] = double.NaN;
+                // Greek slots stay null (default for double?[]); no explicit assignment needed.
+            }
+        }
+    }
+
+    return Results.Ok(new HestonSurfaceResponseWithGreeks(iv, delta, gamma, vega, theta, rho));
+});
+
+// ───────────────── /api/heston-surface-with-greeks/stream (SSE) ─────────────────
+// Same payload as the non-streaming variant, but emits one `event: progress` per cell so
+// the UI can show a live "expiry i/N, strike j/M" progress bar. Each Greek requires several
+// finite-difference pricer evaluations, so a 41×25 grid can take minutes — streaming makes
+// the wait visible instead of a frozen request.
+app.MapPost("/api/heston-surface-with-greeks/stream",
+    async (HttpContext ctx, HestonSurfaceRequest req, CancellationToken ct) =>
+{
+    ctx.Response.Headers["Content-Type"] = "text/event-stream";
+    ctx.Response.Headers["Cache-Control"] = "no-cache";
+    ctx.Response.Headers["X-Accel-Buffering"] = "no";
+
+    int nT = req.Maturities.Length;
+    int nK = req.Strikes.Length;
+    int total = nT * nK;
+
+    // Emit a "started" frame so the bar shows up immediately, before any cell is computed.
+    var startedJson = JsonSerializer.Serialize(new
+    {
+        total,
+        expiries = nT,
+        strikes = nK,
+    }, jsonOpts);
+    await ctx.Response.WriteAsync($"event: started\ndata: {startedJson}\n\n", ct);
+    await ctx.Response.Body.FlushAsync(ct);
+
+    var channel = Channel.CreateUnbounded<object>(new UnboundedChannelOptions
+    {
+        SingleReader = true,
+        SingleWriter = true
+    });
+
+    var p = new HestonModelParams(req.Params.Kappa, req.Params.Theta, req.Params.Sigma, req.Params.Rho, req.Params.V0);
+    var iv    = new double[nT][];
+    var delta = new double?[nT][];
+    var gamma = new double?[nT][];
+    var vega  = new double?[nT][];
+    var theta = new double?[nT][];
+    var rho   = new double?[nT][];
+    for (int i = 0; i < nT; i++)
+    {
+        iv[i]    = new double[nK];
+        delta[i] = new double?[nK];
+        gamma[i] = new double?[nK];
+        vega[i]  = new double?[nK];
+        theta[i] = new double?[nK];
+        rho[i]   = new double?[nK];
+    }
+
+    var task = Task.Run(() =>
+    {
+        try
+        {
+            int counter = 0;
+            for (int i = 0; i < nT; i++)
+            {
+                double t = req.Maturities[i];
+                for (int j = 0; j < nK; j++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    double k = req.Strikes[j];
+                    double cellIv = double.NaN;
+                    double? cellDelta = null, cellGamma = null, cellVega = null, cellTheta = null, cellRho = null;
+                    try
+                    {
+                        cellIv    = HestonPricer.ImpliedVol(p, req.Spot, k, t, req.RiskFreeRate, req.DividendYield);
+                        cellDelta = HestonPricer.CallDelta (p, req.Spot, k, t, req.RiskFreeRate, req.DividendYield);
+                        cellGamma = HestonPricer.Gamma    (p, req.Spot, k, t, req.RiskFreeRate, req.DividendYield);
+                        cellVega  = HestonPricer.Vega     (p, req.Spot, k, t, req.RiskFreeRate, req.DividendYield);
+                        cellTheta = HestonPricer.Theta    (p, req.Spot, k, t, req.RiskFreeRate, req.DividendYield);
+                        cellRho   = HestonPricer.Rho      (p, req.Spot, k, t, req.RiskFreeRate, req.DividendYield);
+                    }
+                    catch
+                    {
+                        // Leave cell values NaN/null; continue with the rest of the grid.
+                    }
+                    iv[i][j]    = cellIv;
+                    delta[i][j] = cellDelta;
+                    gamma[i][j] = cellGamma;
+                    vega[i][j]  = cellVega;
+                    theta[i][j] = cellTheta;
+                    rho[i][j]   = cellRho;
+                    counter++;
+
+                    channel.Writer.TryWrite(new
+                    {
+                        iter = counter,
+                        total,
+                        expiryIdx = i,
+                        strikeIdx = j,
+                        expiry = t,
+                        strike = k,
+                        iv = cellIv,
+                        delta = cellDelta,
+                    });
+                }
+            }
+            channel.Writer.Complete();
+            return new HestonSurfaceResponseWithGreeks(iv, delta, gamma, vega, theta, rho);
+        }
+        catch (Exception ex)
+        {
+            channel.Writer.Complete(ex);
+            throw;
+        }
+    }, ct);
+
+    try
+    {
+        await foreach (var frame in channel.Reader.ReadAllAsync(ct))
+        {
+            var payload = JsonSerializer.Serialize(frame, jsonOpts);
+            await ctx.Response.WriteAsync($"event: progress\ndata: {payload}\n\n", ct);
+            await ctx.Response.Body.FlushAsync(ct);
+        }
+
+        var final = await task;
+        var finalJson = JsonSerializer.Serialize(final, jsonOpts);
+        await ctx.Response.WriteAsync($"event: done\ndata: {finalJson}\n\n", ct);
+        await ctx.Response.Body.FlushAsync(ct);
+    }
+    catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+    catch (Exception ex)
+    {
+        var errPayload = JsonSerializer.Serialize(new { message = ex.Message, type = ex.GetType().Name }, jsonOpts);
+        try
+        {
+            await ctx.Response.WriteAsync($"event: error\ndata: {errPayload}\n\n", CancellationToken.None);
+            await ctx.Response.Body.FlushAsync(CancellationToken.None);
+        }
+        catch { }
+    }
+});
+
 app.Run();
 
 // ───────────────── helpers ─────────────────
@@ -257,3 +452,4 @@ static CalibrationRequest BuildCalibrationRequest(CalibrateApiRequest a, CachedS
     DividendYield = a.DividendYield ?? cached.DividendYield,
     Seed = a.Seed
 };
+

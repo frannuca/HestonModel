@@ -144,6 +144,34 @@
         </label>
         <div id="runStatus" class="status-pill"></div>
       </div>
+
+      <div class="snapshot-row control-row">
+        <div class="control">
+          <label>Snapshot file</label>
+          <div class="snapshot-file-buttons">
+            <button id="saveSnapshotFileBtn" class="primary" type="button">Save to file…</button>
+            <button id="loadSnapshotFileBtn" class="ghost" type="button">Load from file…</button>
+          </div>
+        </div>
+        <div class="snapshot-divider"></div>
+        <div class="control">
+          <label for="snapshotName">Server-stored name</label>
+          <input id="snapshotName" type="text" placeholder="e.g. spx-fit-2026-05-16" />
+        </div>
+        <div class="control">
+          <button id="saveSnapshotBtn" class="ghost" type="button">Save</button>
+        </div>
+        <div class="control">
+          <label for="snapshotPicker">Load existing</label>
+          <select id="snapshotPicker"></select>
+        </div>
+        <div class="control">
+          <button id="loadSnapshotBtn" class="ghost" type="button">Load</button>
+          <button id="deleteSnapshotBtn" class="danger" type="button">Delete</button>
+        </div>
+        <div id="snapshotStatus" class="status-pill"></div>
+      </div>
+      <input id="snapshotFileInput" type="file" accept="application/json,.json" class="hidden-file-input" />
     </div>
   </section>
 

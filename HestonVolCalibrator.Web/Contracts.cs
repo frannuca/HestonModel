@@ -54,3 +54,5 @@ public record HestonSurfaceRequest(
     double[] Maturities);
 
 public record HestonSurfaceResponse(double[][] Iv);
+
+public record SaveSnapshotRequest(string Name, Snapshot Snapshot);

@@ -38,6 +38,7 @@ builder.Services.AddCors(o =>
 });
 
 builder.Services.AddSingleton<SurfaceService>();
+builder.Services.AddSingleton(sp => new SnapshotService(builder.Environment.ContentRootPath));
 
 builder.WebHost.ConfigureKestrel(k =>
 {
@@ -188,6 +189,30 @@ app.MapPost("/api/calibrate/stream", async (HttpContext ctx, CalibrateApiRequest
         }
     }
 });
+
+// ───────────────── /api/snapshot/* ─────────────────
+// Persist & restore the loaded market surface + last calibration so the user can
+// re-open a fitted state without re-fetching/re-calibrating.
+app.MapGet("/api/snapshot/list", (SnapshotService svc) => Results.Ok(svc.List()));
+
+app.MapPost("/api/snapshot/save", async (SaveSnapshotRequest req, SnapshotService svc) =>
+{
+    if (req.Snapshot is null) return Results.BadRequest(new { message = "Snapshot payload is required." });
+    var snap = req.Snapshot with { Version = SnapshotService.SnapshotVersion, CreatedAtUtc = DateTime.UtcNow };
+    await svc.SaveAsync(req.Name, snap);
+    return Results.Ok(new { name = SnapshotService.Sanitize(req.Name), createdAtUtc = snap.CreatedAtUtc });
+});
+
+app.MapGet("/api/snapshot/load/{name}", async (string name, SnapshotService svc) =>
+{
+    var snap = await svc.LoadAsync(name);
+    return snap is null
+        ? Results.NotFound(new { message = $"Snapshot '{name}' not found." })
+        : Results.Ok(snap);
+});
+
+app.MapDelete("/api/snapshot/{name}", (string name, SnapshotService svc) =>
+    svc.Delete(name) ? Results.Ok(new { deleted = true }) : Results.NotFound(new { message = "Not found." }));
 
 // ───────────────── /api/heston-surface ─────────────────
 app.MapPost("/api/heston-surface", (HestonSurfaceRequest req) =>

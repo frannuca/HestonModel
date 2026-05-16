@@ -9,8 +9,11 @@ namespace HestonVolCalibrator.Runner
 {
     class Program
     {
-        static void Main()
+        static int Main(string[] args)
         {
+            if (args.Length > 0 && args[0] == "--snapshot-test")
+                return SnapshotRoundTripTest.Run();
+
             Console.WriteLine("=== Heston Smile Oscillation Diagnostic ===\n");
 
             double spot = 100.0;
@@ -136,6 +139,7 @@ namespace HestonVolCalibrator.Runner
             }
 
             Console.WriteLine("\nDone.");
+            return 0;
         }
     }
 }

@@ -157,6 +157,28 @@ async function apiJson(path, body) {
   return json;
 }
 
+// Generic GET / DELETE helpers for the snapshot endpoints.
+async function apiGet(path) {
+  log("info", "api", `GET ${path}`);
+  const res = await fetch(API + path);
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    log("err", "api", `${path} → ${res.status} ${res.statusText}: ${txt.slice(0, 200)}`);
+    throw new Error(`${res.status} ${res.statusText}: ${txt}`);
+  }
+  return res.json();
+}
+async function apiDelete(path) {
+  log("info", "api", `DELETE ${path}`);
+  const res = await fetch(API + path, { method: "DELETE" });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    log("err", "api", `${path} → ${res.status} ${res.statusText}: ${txt.slice(0, 200)}`);
+    throw new Error(`${res.status} ${res.statusText}: ${txt}`);
+  }
+  return res.json().catch(() => ({}));
+}
+
 // SSE-over-POST stream parser. Calls onProgress(point) and returns the final result.
 async function apiStreamCalibrate(body, signal, onProgress) {
   log("info", "sse", "POST /api/calibrate/stream — opening stream");
@@ -1138,6 +1160,338 @@ function switchTab(name) {
   }
 }
 
+// ───────────────── Snapshots ─────────────────
+// Persist the loaded surface + last calibration to a server-side file and re-hydrate
+// the UI from one later. The frontend builds the snapshot payload from `state` so the
+// save endpoint is stateless — useful when the in-memory cache has rotated.
+function buildSurfaceSnapshot() {
+  const s = state.surface;
+  if (!s) return null;
+  return {
+    ticker: s.ticker,
+    source: s.source,
+    spot: s.spot,
+    riskFreeRate: s.riskFreeRate,
+    dividendYield: s.dividendYield,
+    expiries: s.expiries,
+    strikes: s.strikes,
+    iv: s.iv,
+    callPrice: s.callPrice,
+    putPrice: s.putPrice,
+    cleanStats: s.cleanStats || null,
+  };
+}
+function buildCalibrationSnapshot() {
+  const c = state.calibration;
+  if (!c) return null;
+  return {
+    params: c.hestonParams,
+    finalRmse: c.finalRmse,
+    converged: !!c.converged,
+    totalIterations: c.totalIterations,
+    elapsedMs: c.elapsedMs,
+    expiries: c.expiries,
+    strikes: c.strikes,
+    marketIv: c.marketIv,
+    hestonIv: c.hestonIv,
+    stages: c.stages || [],
+    history: c.history || [],
+  };
+}
+
+// Build the full Snapshot JSON object the way the server expects it.
+function composeSnapshotPayload() {
+  if (!state.surface) return null;
+  return {
+    version: "1.0",
+    createdAtUtc: new Date().toISOString(),
+    surface: buildSurfaceSnapshot(),
+    calibration: buildCalibrationSnapshot(),
+  };
+}
+
+function defaultSnapshotFilename() {
+  const t = state.surface?.ticker || "snapshot";
+  const safe = String(t).toLowerCase().replace(/[^a-z0-9.-]+/g, "_").replace(/^_+|_+$/g, "");
+  const ts = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 16);
+  return `heston-${safe || "snapshot"}-${ts}.json`;
+}
+
+// Save the snapshot to a local file via the browser. Uses the File System Access API
+// (Chrome/Edge) for a real "Save As…" dialog when available; falls back to the classic
+// anchor-download trick everywhere else.
+async function saveSnapshotToFile() {
+  clearError();
+  if (!state.surface) { showError("Load a surface before saving."); return; }
+  const payload = composeSnapshotPayload();
+  const json = JSON.stringify(payload, null, 2);
+  const suggested = defaultSnapshotFilename();
+  setStatus("snapshotStatus", "Saving…", "busy");
+  try {
+    if (window.showSaveFilePicker) {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: suggested,
+        types: [{ description: "Heston snapshot (JSON)", accept: { "application/json": [".json"] } }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(json);
+      await writable.close();
+      setStatus("snapshotStatus", `Saved ${handle.name}`, "ok");
+      log("ok", "snap", `saved file "${handle.name}" (${json.length} bytes)`);
+    } else {
+      // Fallback: synthesize a blob URL and click an anchor — browser shows its
+      // standard download prompt (which is "save as" in most configurations).
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = suggested;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setStatus("snapshotStatus", `Downloaded ${suggested}`, "ok");
+      log("ok", "snap", `downloaded "${suggested}" (${json.length} bytes)`);
+    }
+  } catch (e) {
+    if (e?.name === "AbortError") {
+      setStatus("snapshotStatus", "Cancelled", "err");
+      log("warn", "snap", "save cancelled by user");
+      return;
+    }
+    setStatus("snapshotStatus", "Save failed", "err");
+    showError("Save failed: " + e.message);
+    log("err", "snap", `save failed: ${e.message}`);
+  }
+}
+
+// Load a snapshot from a local file. Uses the File System Access API when available;
+// otherwise triggers the hidden <input type="file"> the OS file picker is attached to.
+async function loadSnapshotFromFile() {
+  clearError();
+  setStatus("snapshotStatus", "Choosing file…", "busy");
+  try {
+    let text;
+    let filename;
+    if (window.showOpenFilePicker) {
+      const [handle] = await window.showOpenFilePicker({
+        types: [{ description: "Heston snapshot (JSON)", accept: { "application/json": [".json"] } }],
+        multiple: false,
+      });
+      filename = handle.name;
+      const file = await handle.getFile();
+      text = await file.text();
+    } else {
+      const file = await pickFileViaInput();
+      filename = file.name;
+      text = await file.text();
+    }
+    const snap = JSON.parse(text);
+    hydrateFromSnapshot(snap);
+    setStatus("snapshotStatus", `Loaded ${filename}`, "ok");
+    log("ok", "snap", `loaded file "${filename}" (${text.length} bytes)`);
+  } catch (e) {
+    if (e?.name === "AbortError") {
+      setStatus("snapshotStatus", "Cancelled", "err");
+      log("warn", "snap", "load cancelled by user");
+      return;
+    }
+    setStatus("snapshotStatus", "Load failed", "err");
+    showError("Load failed: " + e.message);
+    log("err", "snap", `load failed: ${e.message}`);
+  }
+}
+
+// Promise-wrapped <input type="file"> for browsers without the File System Access API.
+// Resolves on the first change event; rejects with AbortError on cancellation.
+function pickFileViaInput() {
+  return new Promise((resolve, reject) => {
+    const input = $("snapshotFileInput");
+    if (!input) return reject(new Error("File input not in DOM"));
+    input.value = "";
+    let settled = false;
+    const onChange = () => {
+      settled = true;
+      input.removeEventListener("change", onChange);
+      window.removeEventListener("focus", onCancel);
+      const f = input.files?.[0];
+      if (!f) {
+        const err = new Error("No file selected");
+        err.name = "AbortError";
+        reject(err);
+      } else {
+        resolve(f);
+      }
+    };
+    // Heuristic cancellation: focus returns to the window without a change firing.
+    const onCancel = () => {
+      setTimeout(() => {
+        if (settled) return;
+        if (input.files?.length) return;
+        input.removeEventListener("change", onChange);
+        window.removeEventListener("focus", onCancel);
+        const err = new Error("Cancelled");
+        err.name = "AbortError";
+        reject(err);
+      }, 250);
+    };
+    input.addEventListener("change", onChange);
+    window.addEventListener("focus", onCancel, { once: true });
+    input.click();
+  });
+}
+
+async function refreshSnapshotList() {
+  try {
+    const list = await apiGet("/api/snapshot/list");
+    const sel = $("snapshotPicker");
+    sel.innerHTML = "";
+    if (list.length === 0) {
+      const opt = document.createElement("option");
+      opt.value = ""; opt.textContent = "(no snapshots yet)";
+      sel.appendChild(opt);
+      sel.disabled = true;
+    } else {
+      sel.disabled = false;
+      for (const entry of list) {
+        const opt = document.createElement("option");
+        opt.value = entry.name;
+        const calib = entry.hasCalibration ? " · calibrated" : "";
+        const ts = new Date(entry.createdAtUtc).toISOString().slice(0, 16).replace("T", " ");
+        opt.textContent = `${entry.name} — ${entry.ticker} (${entry.source})${calib} · ${ts}`;
+        sel.appendChild(opt);
+      }
+    }
+    log("info", "snap", `${list.length} snapshot(s) available`);
+  } catch (e) {
+    log("err", "snap", `list failed: ${e.message}`);
+  }
+}
+
+async function saveSnapshot() {
+  clearError();
+  if (!state.surface) { showError("Load a surface before saving."); return; }
+  const name = ($("snapshotName").value || "").trim();
+  if (!name) { showError("Snapshot name is required."); return; }
+  setStatus("snapshotStatus", "Saving…", "busy");
+  try {
+    const payload = {
+      name,
+      snapshot: {
+        version: "1.0",
+        createdAtUtc: new Date().toISOString(),
+        surface: buildSurfaceSnapshot(),
+        calibration: buildCalibrationSnapshot(),
+      },
+    };
+    const res = await apiJson("/api/snapshot/save", payload);
+    setStatus("snapshotStatus", `Saved as ${res.name}`, "ok");
+    log("ok", "snap", `saved "${res.name}"`);
+    await refreshSnapshotList();
+    // Pre-select the just-saved entry.
+    $("snapshotPicker").value = res.name;
+  } catch (e) {
+    setStatus("snapshotStatus", "Save failed", "err");
+    showError("Save failed: " + e.message);
+  }
+}
+
+async function loadSnapshot() {
+  clearError();
+  const name = $("snapshotPicker").value;
+  if (!name) { showError("Pick a snapshot to load."); return; }
+  setStatus("snapshotStatus", "Loading…", "busy");
+  try {
+    const snap = await apiGet(`/api/snapshot/load/${encodeURIComponent(name)}`);
+    hydrateFromSnapshot(snap);
+    setStatus("snapshotStatus", `Loaded ${name}`, "ok");
+    log("ok", "snap", `loaded "${name}"`);
+  } catch (e) {
+    setStatus("snapshotStatus", "Load failed", "err");
+    showError("Load failed: " + e.message);
+  }
+}
+
+async function deleteSnapshot() {
+  clearError();
+  const name = $("snapshotPicker").value;
+  if (!name) { showError("Pick a snapshot to delete."); return; }
+  if (!confirm(`Delete snapshot "${name}"?`)) return;
+  setStatus("snapshotStatus", "Deleting…", "busy");
+  try {
+    await apiDelete(`/api/snapshot/${encodeURIComponent(name)}`);
+    setStatus("snapshotStatus", `Deleted ${name}`, "ok");
+    log("ok", "snap", `deleted "${name}"`);
+    await refreshSnapshotList();
+  } catch (e) {
+    setStatus("snapshotStatus", "Delete failed", "err");
+    showError("Delete failed: " + e.message);
+  }
+}
+
+// Restore the on-screen state from a snapshot: market surface tab + calibration tabs.
+// This deliberately mirrors the post-load / post-calibrate render paths so the UI looks
+// identical to a freshly-loaded-and-calibrated session.
+function hydrateFromSnapshot(snap) {
+  if (!snap?.surface) throw new Error("Snapshot missing surface");
+  const s = snap.surface;
+  // Reconstruct the SurfaceResponse-shaped object the renderers expect.
+  state.surface = {
+    spot: s.spot,
+    ticker: s.ticker,
+    expiries: s.expiries,
+    strikes: s.strikes,
+    iv: s.iv,
+    callPrice: s.callPrice,
+    putPrice: s.putPrice,
+    source: s.source,
+    riskFreeRate: s.riskFreeRate,
+    dividendYield: s.dividendYield,
+    cleanStats: s.cleanStats || null,
+  };
+  setStatus("surfaceStatus",
+    `Loaded snapshot · ${s.source} surface (spot=${fmt(s.spot, 2)}, ${s.expiries.length}×${s.strikes.length})`,
+    "ok");
+  refreshMarketSourcePill?.();
+  refreshMarketCutControls?.();
+  $("calibPanel").classList.remove("hidden");
+  $("tabsSection").classList.remove("hidden");
+  renderMarketSurface(getSelectedMarketQty());
+  renderMarketCut();
+  // Invalidate caches that depend on the calibration before we render Heston tabs.
+  state.smiles = { denseStrikes: null, denseIv: null };
+  state.smileDetail = { cache: new Map(), rendered: false, lastKey: null };
+
+  if (snap.calibration) {
+    // Project a CalibrationResult-shaped object out of the snapshot.
+    const c = snap.calibration;
+    state.calibration = {
+      hestonParams: c.params,
+      finalRmse: c.finalRmse,
+      converged: c.converged,
+      totalIterations: c.totalIterations,
+      elapsedMs: c.elapsedMs,
+      expiries: c.expiries,
+      strikes: c.strikes,
+      marketIv: c.marketIv,
+      hestonIv: c.hestonIv,
+      stages: c.stages || [],
+      history: c.history || [],
+    };
+    const result = state.calibration;
+    plotConvergenceFromHistory(result.history);
+    renderHestonSurface(result);
+    renderComparison(result);
+    renderResults(result);
+    renderSmiles();
+    setStatus("runStatus",
+      `Loaded: RMSE=${fmt(result.finalRmse, 6)} · iter=${result.totalIterations}`,
+      result.converged === false ? "warn" : "ok");
+    switchTab("results");
+  } else {
+    state.calibration = null;
+    renderSmiles();
+    switchTab("market");
+  }
+}
+
 // ───────────────── Wiring ─────────────────
 function wireUi() {
   setupLogPanel();
@@ -1177,6 +1531,14 @@ function wireUi() {
     const hidden = body.classList.toggle("hidden");
     $("toggleCalibBtn").textContent = hidden ? "Expand" : "Collapse";
   });
+
+  // Snapshot panel wiring.
+  $("saveSnapshotFileBtn").addEventListener("click", saveSnapshotToFile);
+  $("loadSnapshotFileBtn").addEventListener("click", loadSnapshotFromFile);
+  $("saveSnapshotBtn").addEventListener("click", saveSnapshot);
+  $("loadSnapshotBtn").addEventListener("click", loadSnapshot);
+  $("deleteSnapshotBtn").addEventListener("click", deleteSnapshot);
+  refreshSnapshotList();
 
   // Resize on window resize for visible plots.
   window.addEventListener("resize", () => {

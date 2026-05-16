@@ -476,3 +476,21 @@ button.ghost { background: transparent; }
 .log-entry.event .log-tag { color: var(--text-dim); }
 
 body { padding-bottom: 60px; } /* leave room for the docked log */
+
+.snapshot-row {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  align-items: end;
+  gap: 12px;
+}
+.snapshot-row select { min-width: 200px; }
+.snapshot-row .danger { background: transparent; color: var(--danger); border-color: var(--danger); }
+.snapshot-file-buttons { display: flex; gap: 6px; }
+.snapshot-divider {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+  margin: 0 4px;
+}
+.hidden-file-input { display: none; }

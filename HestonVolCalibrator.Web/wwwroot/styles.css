@@ -168,6 +168,7 @@ button.ghost { background: transparent; }
 }
 .status-pill.busy { color: var(--warn); }
 .status-pill.ok { color: var(--good); }
+.status-pill.warn { color: var(--warn); }
 .status-pill.err { color: var(--danger); }
 
 .calib-body { margin-top: 4px; }

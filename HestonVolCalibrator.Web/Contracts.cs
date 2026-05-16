@@ -6,7 +6,11 @@ public record SurfaceRequest(
     string Ticker = "^SPX",
     int MaxExpiries = 6,
     bool ForceSynthetic = false,
-    bool Clean = true);
+    bool Clean = true,
+    double? MinMaturity = null,
+    double? MaxMaturity = null,
+    double? MinMoneyness = null,
+    double? MaxMoneyness = null);
 
 public record SurfaceResponse(
     double Spot,
@@ -17,6 +21,8 @@ public record SurfaceResponse(
     double?[][] CallPrice,
     double?[][] PutPrice,
     string Source,
+    double RiskFreeRate,
+    double DividendYield,
     CleanStatsDto? CleanStats);
 
 public record CalibrateApiRequest

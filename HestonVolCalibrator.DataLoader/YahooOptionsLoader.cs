@@ -44,7 +44,11 @@ namespace HestonVolCalibrator.DataLoader
         }
 
         // Returns (spot, quotes) for SPX.
-        public async Task<(double spot, List<OptionQuote> quotes)> LoadSpxAsync(int maxExpiries = 6)
+        // minMaturity / maxMaturity bound time-to-expiry (years); expiries outside are skipped before HTTP fetch.
+        public async Task<(double spot, List<OptionQuote> quotes)> LoadSpxAsync(
+            int maxExpiries = 6,
+            double minMaturity = 0.0,
+            double maxMaturity = double.PositiveInfinity)
         {
             await EnsureCrumbAsync();
 
@@ -59,7 +63,9 @@ namespace HestonVolCalibrator.DataLoader
             double spot = ParseSpot(baseDoc);
             long[] expiries = ParseExpiryDates(baseDoc);
             Console.WriteLine($"  SPX spot: {spot:F2}");
-            Console.WriteLine($"  Available expiries: {expiries.Length}  (fetching first {Math.Min(maxExpiries, expiries.Length)})");
+            string capLabel = maxExpiries > 0 ? maxExpiries.ToString() : "unlimited";
+            Console.WriteLine($"  Available expiries: {expiries.Length}  " +
+                              $"(maturity window [{minMaturity:F3}, {maxMaturity:F3}]y, cap {capLabel})");
 
             var allQuotes = new List<OptionQuote>();
             DateTime today = DateTime.UtcNow.Date;
@@ -67,10 +73,14 @@ namespace HestonVolCalibrator.DataLoader
             int count = 0;
             foreach (long ts in expiries)
             {
-                if (count++ >= maxExpiries) break;
-
                 DateTime expDate = DateTimeOffset.FromUnixTimeSeconds(ts).UtcDateTime.Date;
                 double t = Math.Max((expDate - today).TotalDays / 365.25, 1.0 / 365.25);
+
+                if (t < minMaturity) continue;
+                if (t > maxMaturity) break; // expiries are ascending in time
+                // maxExpiries <= 0 means "unlimited within the maturity window".
+                if (maxExpiries > 0 && count >= maxExpiries) break;
+                count++;
 
                 string url = $"{baseUrl}?date={ts}{crumbParam}";
                 JsonDocument? doc = await FetchJsonAsync(url);

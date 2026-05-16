@@ -1,107 +1,132 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using HestonVolCalibrator.Interfaces;
 
 namespace HestonVolCalibrator.Implementations
 {
-    // Grid-based volatility surface that stores vol at discrete strike/maturity points
+    // Grid-based volatility surface storing IV at discrete (maturity, strike) points.
+    //
+    // Interpolation:
+    //   - Strike axis: linear in IV (smile shape is already smooth in vol).
+    //   - Maturity axis: linear in TOTAL VARIANCE w = sigma^2 * T. This avoids the
+    //     calendar-arbitrage that linear-in-vol-vs-T can introduce when expiries are sparse.
+    //   - Out-of-grid queries are clamped to the nearest grid boundary (flat extrapolation).
+    //
+    // Internally we keep the strike/maturity axes as sorted arrays so floor/ceil lookups are
+    // O(log N) instead of the prior O(N) linear scan.
     public class GridVolatilitySurface : IVolatilitySurface
     {
         private readonly Dictionary<(double maturity, double strike), double> _data = new();
         private readonly SortedSet<double> _maturities = new();
         private readonly SortedSet<double> _strikes = new();
-        
-        // Cache for interpolation to avoid repeated lookups
-        private (double maturity, double strike, double vol)? _lastQuery;
 
-        public IReadOnlyList<double> Expiries => _maturities.ToArray();
-        public IReadOnlyList<double> Strikes => _strikes.ToArray();
+        // Sorted-array snapshots; rebuilt on AddPoint. Used for O(log N) bracketing.
+        // Kept under the same lock that guards _data to ensure consistency under concurrent reads.
+        private double[] _maturityArr = Array.Empty<double>();
+        private double[] _strikeArr = Array.Empty<double>();
+        private readonly object _gate = new();
 
-        public bool HasPoint(double maturity, double strike) =>
-            _data.ContainsKey((maturity, strike));
+        public IReadOnlyList<double> Expiries
+        {
+            get { lock (_gate) return (double[])_maturityArr.Clone(); }
+        }
+        public IReadOnlyList<double> Strikes
+        {
+            get { lock (_gate) return (double[])_strikeArr.Clone(); }
+        }
+
+        public bool HasPoint(double maturity, double strike)
+        {
+            lock (_gate) return _data.ContainsKey((maturity, strike));
+        }
 
         public void AddPoint(double maturity, double strike, double vol)
         {
-            _data[(maturity, strike)] = vol;
-            _maturities.Add(maturity);
-            _strikes.Add(strike);
-            _lastQuery = null;  // Invalidate cache
+            lock (_gate)
+            {
+                _data[(maturity, strike)] = vol;
+                if (_maturities.Add(maturity)) _maturityArr = _maturities.ToArray();
+                if (_strikes.Add(strike)) _strikeArr = _strikes.ToArray();
+            }
         }
 
         public double GetVolByStrike(double spot, double strike, double maturity)
         {
-            // Quick cache check
-            if (_lastQuery?.maturity == maturity && _lastQuery?.strike == strike)
-                return _lastQuery.Value.vol;
-
-            // Try exact match first
-            if (_data.TryGetValue((maturity, strike), out var vol))
+            lock (_gate)
             {
-                _lastQuery = (maturity, strike, vol);
-                return vol;
+                if (_data.TryGetValue((maturity, strike), out var vol))
+                    return vol;
+                return InterpolateVolLocked(strike, maturity);
             }
-
-            // Bilinear interpolation
-            vol = InterpolateVol(strike, maturity);
-            _lastQuery = (maturity, strike, vol);
-            return vol;
         }
 
         public double GetVolByDelta(double spot, double delta, double maturity)
         {
-            // Convert delta to strike using Black-Scholes approximation
             var strike = DeltaToStrike(spot, delta, maturity);
             return GetVolByStrike(spot, strike, maturity);
         }
 
         public bool HasMaturity(double maturity)
         {
-            return _maturities.Contains(maturity);
+            lock (_gate) return _maturities.Contains(maturity);
         }
 
-        private double InterpolateVol(double strike, double maturity)
+        // Caller must hold _gate.
+        private double InterpolateVolLocked(double strike, double maturity)
         {
-            // Find surrounding strikes and maturities
-            var strikeFloor = FindFloor(_strikes, strike);
-            var strikeCeil = FindCeiling(_strikes, strike);
-            var maturityFloor = FindFloor(_maturities, maturity);
-            var maturityCeil = FindCeiling(_maturities, maturity);
+            if (_maturityArr.Length == 0 || _strikeArr.Length == 0)
+                throw new InvalidOperationException("Surface has no data.");
 
-            // If exact match on one dimension, use 1D interpolation
-            if (strikeFloor == strikeCeil && maturityFloor == maturityCeil)
-                return _data[(maturityFloor, strikeFloor)];
+            // Clamp to grid (flat extrapolation at the boundary).
+            double tQ = Math.Min(Math.Max(maturity, _maturityArr[0]), _maturityArr[^1]);
+            double kQ = Math.Min(Math.Max(strike, _strikeArr[0]), _strikeArr[^1]);
 
-            if (strikeFloor == strikeCeil)
+            var (tLoIdx, tHiIdx, wT) = Bracket(_maturityArr, tQ);
+            var (kLoIdx, kHiIdx, wK) = Bracket(_strikeArr, kQ);
+
+            double tLo = _maturityArr[tLoIdx], tHi = _maturityArr[tHiIdx];
+            double kLo = _strikeArr[kLoIdx],  kHi = _strikeArr[kHiIdx];
+
+            // Strike-direction: linear in IV at each bracketing maturity.
+            double v11 = _data[(tLo, kLo)];
+            double v12 = _data[(tLo, kHi)];
+            double v21 = _data[(tHi, kLo)];
+            double v22 = _data[(tHi, kHi)];
+
+            double sigLo = v11 * (1 - wK) + v12 * wK;   // IV at (tLo, kQ)
+            double sigHi = v21 * (1 - wK) + v22 * wK;   // IV at (tHi, kQ)
+
+            if (tLoIdx == tHiIdx) return sigLo;
+
+            // Maturity-direction: linear in TOTAL VARIANCE w = sigma^2 * T.
+            double wLo = sigLo * sigLo * tLo;
+            double wHi = sigHi * sigHi * tHi;
+            double wInterp = wLo * (1 - wT) + wHi * wT;
+            if (wInterp <= 0 || tQ <= 0) return sigLo; // degenerate guard
+            return Math.Sqrt(wInterp / tQ);
+        }
+
+        // Binary-search bracket. Returns (loIdx, hiIdx, w) such that
+        //   value ≈ arr[loIdx] * (1-w) + arr[hiIdx] * w,    0 <= w <= 1.
+        // Assumes value is already clamped into [arr[0], arr[^1]].
+        private static (int lo, int hi, double w) Bracket(double[] arr, double value)
+        {
+            int lo = 0, hi = arr.Length - 1;
+            if (lo == hi) return (lo, hi, 0.0);
+
+            // Lower bound via binary search: largest index with arr[idx] <= value.
+            int l = 0, r = arr.Length - 1;
+            while (l < r)
             {
-                // Interpolate in maturity only
-                var matVol1 = _data[(maturityFloor, strikeFloor)];
-                var matVol2 = _data[(maturityCeil, strikeFloor)];
-                var w = (maturity - maturityFloor) / (maturityCeil - maturityFloor);
-                return matVol1 * (1 - w) + matVol2 * w;
+                int m = (l + r + 1) >> 1;
+                if (arr[m] <= value) l = m; else r = m - 1;
             }
-
-            if (maturityFloor == maturityCeil)
-            {
-                // Interpolate in strike only
-                var strVol1 = _data[(maturityFloor, strikeFloor)];
-                var strVol2 = _data[(maturityFloor, strikeCeil)];
-                var w = (strike - strikeFloor) / (strikeCeil - strikeFloor);
-                return strVol1 * (1 - w) + strVol2 * w;
-            }
-
-            // Bilinear interpolation
-            var v11 = _data[(maturityFloor, strikeFloor)];
-            var v12 = _data[(maturityFloor, strikeCeil)];
-            var v21 = _data[(maturityCeil, strikeFloor)];
-            var v22 = _data[(maturityCeil, strikeCeil)];
-
-            var wx = (strike - strikeFloor) / (strikeCeil - strikeFloor);
-            var wy = (maturity - maturityFloor) / (maturityCeil - maturityFloor);
-
-            var bilinVol1 = v11 * (1 - wx) + v12 * wx;
-            var bilinVol2 = v21 * (1 - wx) + v22 * wx;
-
-            return bilinVol1 * (1 - wy) + bilinVol2 * wy;
+            int loIdx = l;
+            int hiIdx = Math.Min(loIdx + 1, arr.Length - 1);
+            if (loIdx == hiIdx || arr[hiIdx] == arr[loIdx]) return (loIdx, hiIdx, 0.0);
+            double w = (value - arr[loIdx]) / (arr[hiIdx] - arr[loIdx]);
+            return (loIdx, hiIdx, w);
         }
 
         private double DeltaToStrike(double spot, double delta, double maturity)
@@ -109,34 +134,8 @@ namespace HestonVolCalibrator.Implementations
             if (delta <= 0 || delta >= 1)
                 throw new System.ArgumentException("Delta must be in (0, 1)");
 
-            // Get ATM vol for rough approximation
             var atmVol = GetVolByStrike(spot, spot, maturity);
-            
-            // Use Black-Scholes to convert delta to strike
             return BlackScholes.DeltaToStrike(spot, delta, atmVol, maturity);
-        }
-
-        private static double FindFloor(SortedSet<double> set, double value)
-        {
-            var floor = double.NegativeInfinity;
-            foreach (var v in set)
-            {
-                if (v <= value)
-                    floor = v;
-                else
-                    break;
-            }
-            return floor;
-        }
-
-        private static double FindCeiling(SortedSet<double> set, double value)
-        {
-            foreach (var v in set)
-            {
-                if (v >= value)
-                    return v;
-            }
-            return double.PositiveInfinity;
         }
     }
 }

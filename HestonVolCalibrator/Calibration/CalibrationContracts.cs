@@ -3,8 +3,19 @@ using System.Collections.Generic;
 
 namespace HestonVolCalibrator.Calibration
 {
-    public enum GlobalMethod { None, NelderMead, Genetic }
-    public enum GradientMethod { None, Bfgs, BfgsB }
+    public enum GlobalMethod
+    {
+        None,
+        NelderMead,
+        Genetic
+    }
+
+    public enum GradientMethod
+    {
+        None,
+        Bfgs,
+        BfgsB
+    }
 
     public record ConvergencePoint(int Iter, double Rmse, string Stage);
 
@@ -24,8 +35,8 @@ namespace HestonVolCalibrator.Calibration
         public ParamBounds Kappa { get; init; } = new(0.01, 20.0);
         public ParamBounds Theta { get; init; } = new(1e-4, 1.0);
         public ParamBounds Sigma { get; init; } = new(0.01, 5.0);
-        public ParamBounds Rho   { get; init; } = new(-0.99, 0.99);
-        public ParamBounds V0    { get; init; } = new(1e-4, 1.0);
+        public ParamBounds Rho { get; init; } = new(-0.99, 0.99);
+        public ParamBounds V0 { get; init; } = new(1e-4, 1.0);
 
         public double[]? InitialGuess { get; init; }
 
@@ -35,6 +46,11 @@ namespace HestonVolCalibrator.Calibration
 
         public int? Seed { get; init; }
     }
+
+    // Per-stage diagnostics from the optimisation pipeline.
+    // Allows the frontend to flag iteration-cap exits ("(capped)" in Method) so the user knows
+    // results are best-so-far rather than fully converged.
+    public record StageResult(string Stage, string Method, bool Converged, int Iterations, double FinalValue);
 
     public record CalibrationResult
     {
@@ -47,5 +63,10 @@ namespace HestonVolCalibrator.Calibration
         public double[] Strikes { get; init; } = Array.Empty<double>();
         public int TotalIterations { get; init; }
         public double ElapsedMs { get; init; }
+
+        // True only if every executed stage reported Converged=true.
+        public bool Converged { get; init; }
+        // Per-stage breakdown (global, gradient). Lets the frontend show which stage capped.
+        public List<StageResult> Stages { get; init; } = new();
     }
 }

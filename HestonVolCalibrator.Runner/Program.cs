@@ -44,9 +44,9 @@ namespace HestonVolCalibrator.Runner
                 GlobalMethod = GlobalMethod.NelderMead,
                 GradientMethod = GradientMethod.BfgsB,
                 Chain = true,
-                NelderMeadRestarts = 3,
-                GlobalMaxIterations = 2000,
-                GradientMaxIterations = 500,
+                NelderMeadRestarts = 1,
+                GlobalMaxIterations = 200,
+                GradientMaxIterations = 50,
                 Seed = 42,
             };
 

@@ -19,6 +19,8 @@ public sealed class CachedSurface
     public required double[][] Iv { get; init; }
     public required double?[][] CallPrice { get; init; }
     public required double?[][] PutPrice { get; init; }
+    public required double RiskFreeRate { get; init; }
+    public required double DividendYield { get; init; }
     public CleanStatsDto? CleanStats { get; init; }
     public DateTimeOffset FetchedAt { get; init; } = DateTimeOffset.UtcNow;
 }
@@ -33,8 +35,10 @@ public sealed record CleanStatsDto(
 
 public sealed class SurfaceService
 {
-    private const double RiskFreeRate = 0.045;
-    private const double DividendYield = 0.013;
+    // Public so the rest of the API (calibration, heston-surface, frontend payloads) can align
+    // its rate/dividend assumptions with the values used to build the IV surface.
+    public const double RiskFreeRate = 0.045;
+    public const double DividendYield = 0.013;
 
     private readonly ConcurrentDictionary<string, CachedSurface> _cache = new();
 
@@ -43,8 +47,17 @@ public sealed class SurfaceService
         int maxExpiries,
         bool forceSynthetic = false,
         bool clean = true,
-        QuoteCleaner.CleanOptions? cleanOptions = null)
+        QuoteCleaner.CleanOptions? cleanOptions = null,
+        double? minMaturity = null,
+        double? maxMaturity = null,
+        double? minMoneyness = null,
+        double? maxMoneyness = null)
     {
+        double tLo = minMaturity ?? 0.0;
+        double tHi = maxMaturity ?? double.PositiveInfinity;
+        double mLo = minMoneyness ?? 0.0;
+        double mHi = maxMoneyness ?? double.PositiveInfinity;
+
         double spot;
         System.Collections.Generic.List<OptionQuote> quotes;
         string source;
@@ -59,7 +72,7 @@ public sealed class SurfaceService
             try
             {
                 using var loader = new YahooOptionsLoader();
-                (spot, quotes) = await loader.LoadSpxAsync(maxExpiries: maxExpiries);
+                (spot, quotes) = await loader.LoadSpxAsync(maxExpiries, tLo, tHi);
                 if (spot <= 0 || quotes.Count == 0)
                     throw new Exception("Empty Yahoo response.");
                 source = "yahoo";
@@ -69,6 +82,17 @@ public sealed class SurfaceService
                 (spot, quotes) = SyntheticSurface.BuildSpx();
                 source = "synthetic";
             }
+        }
+
+        // Apply maturity & moneyness windows uniformly (covers synthetic path and double-guards Yahoo).
+        if (spot > 0 && (tLo > 0 || !double.IsPositiveInfinity(tHi) || mLo > 0 || !double.IsPositiveInfinity(mHi)))
+        {
+            quotes = quotes.Where(q =>
+            {
+                if (q.Maturity < tLo || q.Maturity > tHi) return false;
+                double m = q.Strike / spot;
+                return m >= mLo && m <= mHi;
+            }).ToList();
         }
 
         CleanStatsDto? cleanDto = null;
@@ -112,6 +136,8 @@ public sealed class SurfaceService
             Iv = iv,
             CallPrice = callPrice,
             PutPrice = putPrice,
+            RiskFreeRate = RiskFreeRate,
+            DividendYield = DividendYield,
             CleanStats = cleanDto
         };
         _cache[ticker] = cached;

@@ -50,7 +50,7 @@ function clearError() {
 function setStatus(pillId, text, cls) {
   const el = $(pillId);
   el.textContent = text || "";
-  el.classList.remove("busy", "ok", "err");
+  el.classList.remove("busy", "ok", "err", "warn");
   if (cls) el.classList.add(cls);
 }
 
@@ -114,6 +114,11 @@ async function apiStreamCalibrate(body, signal, onProgress) {
       try { payload = JSON.parse(dataLines.join("\n")); } catch { continue; }
       if (event === "progress") onProgress(payload);
       else if (event === "done") finalResult = payload;
+      else if (event === "error") {
+        const msg = payload?.message || "Calibration failed.";
+        const type = payload?.type ? ` (${payload.type})` : "";
+        throw new Error(msg + type);
+      }
     }
   }
   return finalResult;
@@ -123,14 +128,39 @@ async function apiStreamCalibrate(body, signal, onProgress) {
 async function loadSurface() {
   clearError();
   const ticker = $("ticker").value.trim() || "^SPX";
-  const maxExpiries = parseInt($("maxExpiries").value, 10) || 6;
+  // 0 = unlimited (within the maturity window); preserve it instead of falling back to a default.
+  const maxExpiriesRaw = parseInt($("maxExpiries").value, 10);
+  const maxExpiries = Number.isFinite(maxExpiriesRaw) && maxExpiriesRaw >= 0 ? maxExpiriesRaw : 6;
   const forceSynthetic = $("forceSynthetic").checked;
   const clean = $("cleanQuotes")?.checked ?? true;
+
+  const readOptionalFloat = (id) => {
+    const v = $(id)?.value;
+    if (v === undefined || v === "") return null;
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const minMaturity = readOptionalFloat("minMaturity");
+  const maxMaturity = readOptionalFloat("maxMaturity");
+  const minMoneyness = readOptionalFloat("minMoneyness");
+  const maxMoneyness = readOptionalFloat("maxMoneyness");
+
+  if (minMaturity !== null && maxMaturity !== null && maxMaturity <= minMaturity) {
+    showError("Max T must be greater than Min T.");
+    return;
+  }
+  if (minMoneyness !== null && maxMoneyness !== null && maxMoneyness <= minMoneyness) {
+    showError("Max K/S must be greater than Min K/S.");
+    return;
+  }
 
   $("loadSurfaceBtn").disabled = true;
   setStatus("surfaceStatus", "Loading…", "busy");
   try {
-    const data = await apiJson("/api/surface", { ticker, maxExpiries, forceSynthetic, clean });
+    const data = await apiJson("/api/surface", {
+      ticker, maxExpiries, forceSynthetic, clean,
+      minMaturity, maxMaturity, minMoneyness, maxMoneyness,
+    });
     state.surface = data;
     let msg = `Loaded ${data.source} surface (spot=${fmt(data.spot, 2)}, ` +
       `${data.expiries.length} expiries × ${data.strikes.length} strikes)`;
@@ -260,7 +290,6 @@ function resetConvergencePlot() {
 
 function appendConvergencePoint(pt) {
   const idx = pt.stage === "gradient" ? 1 : 0;
-  // Filter non-finite for log axis safety.
   const y = (pt.rmse > 0 && Number.isFinite(pt.rmse)) ? pt.rmse : null;
   if (y === null) return;
   Plotly.extendTraces("plot-convergence", { x: [[pt.iter]], y: [[y]] }, [idx]);
@@ -309,9 +338,15 @@ async function runCalibration() {
     }
     if (!result) throw new Error("No final result returned.");
     state.calibration = result;
-    setStatus("runStatus",
-      `Done. RMSE=${fmt(result.finalRmse, 6)} · iter=${result.totalIterations} · ${result.elapsedMs?.toFixed(0)}ms`,
-      "ok");
+    const cappedStages = (result.stages || []).filter(s => s && s.converged === false);
+    const convergedFlag = result.converged === false || cappedStages.length > 0;
+    const baseMsg = `RMSE=${fmt(result.finalRmse, 6)} · iter=${result.totalIterations} · ${result.elapsedMs?.toFixed(0)}ms`;
+    if (convergedFlag) {
+      const names = cappedStages.map(s => s.stage || s.method || "?").join(", ") || "unknown stage";
+      setStatus("runStatus", `Done (cap hit: ${names}). ${baseMsg}`, "warn");
+    } else {
+      setStatus("runStatus", `Done. ${baseMsg}`, "ok");
+    }
 
     renderHestonSurface(result);
     renderComparison(result);
@@ -600,9 +635,7 @@ function renderComparison(res) {
 }
 
 function renderResults(res) {
-  // Backend returns the calibrated params as `hestonParams`.
-  const p = (res && (res.hestonParams || res.params)) || {};
-  // Param table
+  const p = (res && res.hestonParams) || {};
   const rows = [
     ["κ (kappa)", p.kappa],
     ["θ (theta)", p.theta],
@@ -632,8 +665,8 @@ async function fetchDenseHestonSmiles(res) {
   const payload = {
     params: cparams,
     spot: state.surface.spot,
-    riskFreeRate: 0.04,
-    dividendYield: 0.0,
+    riskFreeRate: surfaceRiskFreeRate(),
+    dividendYield: surfaceDividendYield(),
     strikes: denseStrikes,
     maturities: res.expiries,
   };
@@ -785,8 +818,8 @@ async function fetchSmileDetailHeston(idx, strikeCount, kmin, kmax) {
   const payload = {
     params: cparams,
     spot: state.surface.spot,
-    riskFreeRate: 0.04,
-    dividendYield: 0.0,
+    riskFreeRate: surfaceRiskFreeRate(),
+    dividendYield: surfaceDividendYield(),
     strikes,
     maturities: [T],
   };
@@ -928,8 +961,8 @@ async function plotInterpolatedHestonSurface() {
     const res = await apiJson("/api/heston-surface", {
       params: cparams,
       spot: state.surface.spot,
-      riskFreeRate: 0.04,
-      dividendYield: 0.0,
+      riskFreeRate: surfaceRiskFreeRate(),
+      dividendYield: surfaceDividendYield(),
       strikes,
       maturities,
     });
@@ -949,6 +982,17 @@ async function plotInterpolatedHestonSurface() {
   } finally {
     $("plotInterpBtn").disabled = false;
   }
+}
+
+// Rates the loaded surface was built with — the calibrator and any post-fit Heston pricing
+// must use the same values, otherwise the model and market IVs sit on different forward curves.
+function surfaceRiskFreeRate() {
+  const r = state.surface && state.surface.riskFreeRate;
+  return Number.isFinite(r) ? r : 0.045;
+}
+function surfaceDividendYield() {
+  const q = state.surface && state.surface.dividendYield;
+  return Number.isFinite(q) ? q : 0.013;
 }
 
 function linspace(a, b, n) {

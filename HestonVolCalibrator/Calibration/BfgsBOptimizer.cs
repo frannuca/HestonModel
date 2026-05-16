@@ -38,19 +38,25 @@ namespace HestonVolCalibrator.Calibration
             // Outer-iteration counter: incremented exactly once per gradient evaluation.
             // (See BfgsOptimizer for the rationale.)
             int outerIter = 0;
+            int fEvals = 0;
             double bestF = double.PositiveInfinity;
             double[] bestX = (double[])xStart.Clone();
             bool capHit = false;
+            // Hard ceiling on F() evals so a pathological line search can't run forever
+            // even if Math.NET's internal cap is masked. 50 evals/iter is generous: ~10 for
+            // central-difference gradient + line-search probes.
+            int fEvalCap = Math.Max(50, opts.MaxIterations * 50);
 
-            // Stop signal: once the cap is hit, Grad returns a zero vector so Math.NET's
-            // stopping criteria fire (no descent direction). We also stop reporting after that
-            // so the history matches the user's MaxIterations exactly.
+            // Stop signal: once outerIter hits MaxIterations (or fEvals hits its ceiling) we
+            // throw out of the inner functions. Math.NET propagates the exception and our
+            // outer catch returns the best-so-far. This is more deterministic than nudging
+            // Math.NET with a zero gradient.
             Vector<double> Grad(Vector<double> x)
             {
                 if (outerIter >= opts.MaxIterations)
                 {
                     capHit = true;
-                    return Vector<double>.Build.Dense(n, 0.0);
+                    throw new IterationCapException();
                 }
                 outerIter++;
 
@@ -84,6 +90,11 @@ namespace HestonVolCalibrator.Calibration
 
             double F(Vector<double> x)
             {
+                if (++fEvals > fEvalCap)
+                {
+                    capHit = true;
+                    throw new IterationCapException();
+                }
                 double f = obj.Evaluate(x.ToArray());
                 if (f < bestF)
                 {
@@ -114,6 +125,10 @@ namespace HestonVolCalibrator.Calibration
                 var x = res.MinimizingPoint.ToArray();
                 bool converged = res.ReasonForExit != ExitCondition.ExceedIterations && !capHit;
                 return new OptimizationResult(x, res.FunctionInfoAtMinimum.Value, outerIter, converged, "BfgsB");
+            }
+            catch (IterationCapException)
+            {
+                return new OptimizationResult(bestX, bestF, outerIter, false, "BfgsB (capped)");
             }
             catch
             {

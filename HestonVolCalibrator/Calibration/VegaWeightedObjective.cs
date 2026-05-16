@@ -47,10 +47,16 @@ namespace HestonVolCalibrator.Calibration
                 double marketVol;
                 try { marketVol = _surface.GetVolByStrike(_spot, k, m); }
                 catch { continue; }
+                // BsImpliedVol now returns NaN for unsolvable cells (price outside the no-arb band,
+                // Newton non-convergence). Such cells carry no fit information — skip rather than
+                // propagating NaN through the weights, which would corrupt the whole objective.
+                if (double.IsNaN(marketVol) || double.IsInfinity(marketVol) || marketVol <= 0.0) continue;
 
                 double modelVol;
                 try { modelVol = HestonPricer.ImpliedVol(p, _spot, k, m, _rate, _q); }
                 catch { return double.MaxValue; }
+                // Model NaN at a *valid* market cell is different — it usually signals a bad parameter
+                // vector (e.g. Feller-violating extreme). Treat as MaxValue so the optimiser steers away.
                 if (double.IsNaN(modelVol) || double.IsInfinity(modelVol)) return double.MaxValue;
 
                 double sqrtT = Math.Sqrt(m);

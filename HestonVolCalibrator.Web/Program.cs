@@ -69,27 +69,46 @@ app.MapGet("/api/health", () => Results.Ok(new { ok = true }));
 // ───────────────── /api/surface ─────────────────
 app.MapPost("/api/surface", async (SurfaceRequest req, SurfaceService svc) =>
 {
-    var cached = await svc.FetchAsync(req.Ticker, req.MaxExpiries, req.ForceSynthetic, req.Clean);
+    var cached = await svc.FetchAsync(
+        req.Ticker, req.MaxExpiries, req.ForceSynthetic, req.Clean,
+        cleanOptions: null,
+        minMaturity: req.MinMaturity,
+        maxMaturity: req.MaxMaturity,
+        minMoneyness: req.MinMoneyness,
+        maxMoneyness: req.MaxMoneyness);
     return Results.Ok(new SurfaceResponse(
         cached.Spot, cached.Ticker, cached.Expiries, cached.Strikes, cached.Iv,
-        cached.CallPrice, cached.PutPrice, cached.Source, cached.CleanStats));
+        cached.CallPrice, cached.PutPrice, cached.Source,
+        cached.RiskFreeRate, cached.DividendYield, cached.CleanStats));
 });
 
 // ───────────────── /api/calibrate ─────────────────
-app.MapPost("/api/calibrate", async (CalibrateApiRequest req, SurfaceService svc) =>
+app.MapPost("/api/calibrate", async (CalibrateApiRequest req, SurfaceService svc, ILoggerFactory lf) =>
 {
-    var cached = await svc.GetOrFetchAsync(req.Ticker, maxExpiries: 6);
-    var calibReq = BuildCalibrationRequest(req, cached.Spot);
-    var calibrator = new HestonCalibrator(new SurfaceMarketData(cached.Surface));
-    var result = calibrator.Calibrate(calibReq, cached.Surface);
-    return Results.Ok(result);
+    var logger = lf.CreateLogger("Calibrate");
+    try
+    {
+        var cached = await svc.GetOrFetchAsync(req.Ticker, maxExpiries: 6);
+        var calibReq = BuildCalibrationRequest(req, cached);
+        var calibrator = new HestonCalibrator(new SurfaceMarketData(cached.Surface));
+        var result = calibrator.Calibrate(calibReq, cached.Surface);
+        return Results.Ok(result);
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Calibration failed for ticker {Ticker}", req.Ticker);
+        return Results.Problem(
+            title: "Calibration failed",
+            detail: ex.Message,
+            statusCode: StatusCodes.Status500InternalServerError);
+    }
 });
 
 // ───────────────── /api/calibrate/stream (SSE) ─────────────────
 app.MapPost("/api/calibrate/stream", async (HttpContext ctx, CalibrateApiRequest req, SurfaceService svc, CancellationToken ct) =>
 {
     var cached = await svc.GetOrFetchAsync(req.Ticker, maxExpiries: 6);
-    var calibReq = BuildCalibrationRequest(req, cached.Spot);
+    var calibReq = BuildCalibrationRequest(req, cached);
 
     ctx.Response.Headers["Content-Type"] = "text/event-stream";
     ctx.Response.Headers["Cache-Control"] = "no-cache";
@@ -121,17 +140,37 @@ app.MapPost("/api/calibrate/stream", async (HttpContext ctx, CalibrateApiRequest
         }
     }, ct);
 
-    await foreach (var pt in channel.Reader.ReadAllAsync(ct))
+    try
     {
-        var payload = JsonSerializer.Serialize(pt, jsonOpts);
-        await ctx.Response.WriteAsync($"event: progress\ndata: {payload}\n\n", ct);
+        await foreach (var pt in channel.Reader.ReadAllAsync(ct))
+        {
+            var payload = JsonSerializer.Serialize(pt, jsonOpts);
+            await ctx.Response.WriteAsync($"event: progress\ndata: {payload}\n\n", ct);
+            await ctx.Response.Body.FlushAsync(ct);
+        }
+
+        var final = await calibTask;
+        var finalJson = JsonSerializer.Serialize(final, jsonOpts);
+        await ctx.Response.WriteAsync($"event: done\ndata: {finalJson}\n\n", ct);
         await ctx.Response.Body.FlushAsync(ct);
     }
-
-    var final = await calibTask;
-    var finalJson = JsonSerializer.Serialize(final, jsonOpts);
-    await ctx.Response.WriteAsync($"event: done\ndata: {finalJson}\n\n", ct);
-    await ctx.Response.Body.FlushAsync(ct);
+    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+    {
+        // Client disconnected — nothing to emit.
+    }
+    catch (Exception ex)
+    {
+        var errPayload = JsonSerializer.Serialize(new { message = ex.Message, type = ex.GetType().Name }, jsonOpts);
+        try
+        {
+            await ctx.Response.WriteAsync($"event: error\ndata: {errPayload}\n\n", CancellationToken.None);
+            await ctx.Response.Body.FlushAsync(CancellationToken.None);
+        }
+        catch
+        {
+            // Response may already be closed; nothing more we can do.
+        }
+    }
 });
 
 // ───────────────── /api/heston-surface ─────────────────
@@ -155,7 +194,10 @@ app.MapPost("/api/heston-surface", (HestonSurfaceRequest req) =>
 app.Run();
 
 // ───────────────── helpers ─────────────────
-static CalibrationRequest BuildCalibrationRequest(CalibrateApiRequest a, double spot) => new()
+// Defaults rate/dividend to the cached surface's values so the calibrator and the surface
+// being fit assume the same forward curve. Mismatched rates lead to a systematic IV bias
+// the optimiser cannot fully absorb when fitting one Heston to all expiries simultaneously.
+static CalibrationRequest BuildCalibrationRequest(CalibrateApiRequest a, CachedSurface cached) => new()
 {
     GlobalMethod = a.GlobalMethod,
     GradientMethod = a.GradientMethod,
@@ -169,8 +211,8 @@ static CalibrationRequest BuildCalibrationRequest(CalibrateApiRequest a, double 
     Rho = a.Rho,
     V0 = a.V0,
     InitialGuess = a.InitialGuess,
-    Spot = spot,
-    RiskFreeRate = a.RiskFreeRate ?? 0.04,
-    DividendYield = a.DividendYield ?? 0.0,
+    Spot = cached.Spot,
+    RiskFreeRate = a.RiskFreeRate ?? cached.RiskFreeRate,
+    DividendYield = a.DividendYield ?? cached.DividendYield,
     Seed = a.Seed
 };

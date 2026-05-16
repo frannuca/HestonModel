@@ -27,17 +27,13 @@ namespace HestonVolCalibrator.Calibration
             var sw = Stopwatch.StartNew();
             var history = new List<ConvergencePoint>();
 
-            // Build (maturity, strike) sample grid from the surface.
+            // Sample every (maturity, strike) cell — one global fit over the full surface.
             var expiries = surface.Expiries.OrderBy(t => t).ToArray();
             var strikes  = surface.Strikes.OrderBy(k => k).ToArray();
             var pts = new List<(double, double)>(expiries.Length * strikes.Length);
             foreach (var t in expiries)
                 foreach (var k in strikes)
-                {
-                    // Skip cells with no underlying data (interpolation away from grid points
-                    // is fine but only if we have at least the corners; the grid is dense here).
                     pts.Add((t, k));
-                }
 
             double[] lower = { req.Kappa.Lower, req.Theta.Lower, req.Sigma.Lower, req.Rho.Lower, req.V0.Lower };
             double[] upper = { req.Kappa.Upper, req.Theta.Upper, req.Sigma.Upper, req.Rho.Upper, req.V0.Upper };
@@ -45,7 +41,6 @@ namespace HestonVolCalibrator.Calibration
             var objective = new VegaWeightedObjective(
                 surface, req.Spot, req.RiskFreeRate, req.DividendYield, pts, lower, upper);
 
-            // Initial guess.
             double[] x0 = req.InitialGuess ?? DefaultInitialGuess(surface, req.Spot);
             for (int i = 0; i < x0.Length; i++)
                 x0[i] = Math.Min(Math.Max(x0[i], lower[i] + 1e-8), upper[i] - 1e-8);
@@ -53,6 +48,7 @@ namespace HestonVolCalibrator.Calibration
             int totalIters = 0;
             double[] currentBest = (double[])x0.Clone();
             double currentBestF = objective.Evaluate(currentBest);
+            var stages = new List<StageResult>();
 
             // ── Global stage ──
             if (req.GlobalMethod != GlobalMethod.None)
@@ -75,6 +71,7 @@ namespace HestonVolCalibrator.Calibration
 
                 var gres = global.Minimize(objective, x0, gOpts, GlobalCb);
                 totalIters += gres.Iterations;
+                stages.Add(new StageResult("global", gres.Method, gres.Converged, gres.Iterations, gres.FinalValue));
                 if (gres.FinalValue < currentBestF)
                 {
                     currentBest = gres.X;
@@ -93,10 +90,9 @@ namespace HestonVolCalibrator.Calibration
                 };
 
                 double[] startX = req.Chain ? currentBest : x0;
-
                 var grOpts = new OptimizerOptions(req.GradientMaxIterations, 1e-8, req.Seed);
-
                 int globalBase = history.Count;
+
                 void GradCb(int it, double f, double[] x)
                 {
                     var pt = new ConvergencePoint(globalBase + it, f, "gradient");
@@ -106,6 +102,7 @@ namespace HestonVolCalibrator.Calibration
 
                 var rres = grad.Minimize(objective, startX, grOpts, GradCb);
                 totalIters += rres.Iterations;
+                stages.Add(new StageResult("gradient", rres.Method, rres.Converged, rres.Iterations, rres.FinalValue));
                 if (rres.FinalValue < currentBestF)
                 {
                     currentBest = rres.X;
@@ -113,10 +110,14 @@ namespace HestonVolCalibrator.Calibration
                 }
             }
 
-            // ── Build market & model IV matrices ──
+            bool allConverged = stages.Count > 0 && stages.TrueForAll(s => s.Converged);
+
+            var fitted = new HestonParams(currentBest[0], currentBest[1], currentBest[2], currentBest[3], currentBest[4]);
+            var fittedModel = new HestonModelParams(fitted.Kappa, fitted.Theta, fitted.Sigma, fitted.Rho, fitted.V0);
+
+            // ── Build market & Heston IV matrices ──
             var marketIv = new double[expiries.Length][];
             var hestonIv = new double[expiries.Length][];
-            var fitted = new HestonModelParams(currentBest[0], currentBest[1], currentBest[2], currentBest[3], currentBest[4]);
             for (int i = 0; i < expiries.Length; i++)
             {
                 marketIv[i] = new double[strikes.Length];
@@ -126,7 +127,7 @@ namespace HestonVolCalibrator.Calibration
                 {
                     double k = strikes[j];
                     try { marketIv[i][j] = surface.GetVolByStrike(req.Spot, k, t); } catch { marketIv[i][j] = double.NaN; }
-                    try { hestonIv[i][j] = HestonPricer.ImpliedVol(fitted, req.Spot, k, t, req.RiskFreeRate, req.DividendYield); }
+                    try { hestonIv[i][j] = HestonPricer.ImpliedVol(fittedModel, req.Spot, k, t, req.RiskFreeRate, req.DividendYield); }
                     catch { hestonIv[i][j] = double.NaN; }
                 }
             }
@@ -134,7 +135,7 @@ namespace HestonVolCalibrator.Calibration
             sw.Stop();
             return new CalibrationResult
             {
-                HestonParams = new HestonParams(currentBest[0], currentBest[1], currentBest[2], currentBest[3], currentBest[4]),
+                HestonParams = fitted,
                 FinalRmse = currentBestF,
                 History = history,
                 MarketIv = marketIv,
@@ -142,7 +143,9 @@ namespace HestonVolCalibrator.Calibration
                 Expiries = expiries,
                 Strikes = strikes,
                 TotalIterations = totalIters,
-                ElapsedMs = sw.Elapsed.TotalMilliseconds
+                ElapsedMs = sw.Elapsed.TotalMilliseconds,
+                Converged = allConverged,
+                Stages = stages
             };
         }
 

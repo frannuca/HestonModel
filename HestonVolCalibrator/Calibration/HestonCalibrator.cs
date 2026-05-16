@@ -27,9 +27,33 @@ namespace HestonVolCalibrator.Calibration
             var sw = Stopwatch.StartNew();
             var history = new List<ConvergencePoint>();
 
-            // Sample every (maturity, strike) cell — one global fit over the full surface.
+            // Build the fit grid. Real market surfaces can have 100+ strikes; one objective
+            // evaluation at that size dominates a multi-second Heston-pricer call per cell, so a
+            // single NM iteration can take minutes. We sub-sample strikes evenly so the optimiser
+            // produces visible progress within seconds. 11 strikes captures both wings and the
+            // ATM kink for a single-Heston fit. Expiries are kept in full (they shape the term
+            // structure and there are rarely more than ~10).
+            const int MaxStrikesPerExpiry = 21;
             var expiries = surface.Expiries.OrderBy(t => t).ToArray();
-            var strikes  = surface.Strikes.OrderBy(k => k).ToArray();
+            var allStrikes = surface.Strikes.OrderBy(k => k).ToArray();
+            double[] strikes;
+            if (allStrikes.Length <= MaxStrikesPerExpiry)
+            {
+                strikes = allStrikes;
+            }
+            else
+            {
+                // Even-spaced index sub-sample preserving both ATM and the wings.
+                strikes = new double[MaxStrikesPerExpiry];
+                for (int i = 0; i < MaxStrikesPerExpiry; i++)
+                {
+                    int idx = (int)Math.Round((double)i * (allStrikes.Length - 1) / (MaxStrikesPerExpiry - 1));
+                    strikes[i] = allStrikes[idx];
+                }
+                // Deduplicate (rare rounding tie at edges).
+                strikes = strikes.Distinct().OrderBy(k => k).ToArray();
+            }
+
             var pts = new List<(double, double)>(expiries.Length * strikes.Length);
             foreach (var t in expiries)
                 foreach (var k in strikes)

@@ -72,7 +72,7 @@ public sealed class SurfaceService
             try
             {
                 using var loader = new YahooOptionsLoader();
-                (spot, quotes) = await loader.LoadSpxAsync(maxExpiries, tLo, tHi);
+                (spot, quotes) = await loader.LoadAsync(ticker, maxExpiries, tLo, tHi);
                 if (spot <= 0 || quotes.Count == 0)
                     throw new Exception("Empty Yahoo response.");
                 source = "yahoo";

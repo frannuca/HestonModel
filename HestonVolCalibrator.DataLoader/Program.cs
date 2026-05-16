@@ -33,7 +33,7 @@ public static class Program
 
         try
         {
-            (spot, rawQuotes) = await loader.LoadSpxAsync(maxExpiries: 6);
+            (spot, rawQuotes) = await loader.LoadAsync("^SPX", maxExpiries: 6);
         }
         catch (Exception ex)
         {

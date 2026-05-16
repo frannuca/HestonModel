@@ -261,6 +261,18 @@
     <span>Heston calibration UI &middot; Plotly 3D &middot; vanilla JS</span>
   </footer>
 
+  <section id="logPanel" class="log-panel collapsed">
+    <div class="log-header">
+      <span class="log-title">Activity log</span>
+      <span id="logBadge" class="log-badge">0</span>
+      <div class="log-controls">
+        <button id="logClearBtn" class="ghost" type="button">Clear</button>
+        <button id="logToggleBtn" class="ghost" type="button">Expand</button>
+      </div>
+    </div>
+    <div id="logBody" class="log-body"></div>
+  </section>
+
   <script type="module" src="app.js"></script>
 </body>
 </html>

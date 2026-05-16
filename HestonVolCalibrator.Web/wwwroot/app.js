@@ -54,6 +54,83 @@ function setStatus(pillId, text, cls) {
   if (cls) el.classList.add(cls);
 }
 
+// ───────────────── Activity log ─────────────────
+// Visible bottom-docked panel. Captures SSE events, API calls, and errors so
+// the user can see what is happening without opening DevTools.
+const logState = { count: 0, errorCount: 0, warnCount: 0, lastProgressIter: -1, progressBatched: 0 };
+const MAX_LOG_ENTRIES = 500;
+
+function log(level, tag, msg) {
+  const body = $("logBody");
+  if (!body) return; // panel not yet in DOM
+  const row = document.createElement("div");
+  row.className = `log-entry ${level}`;
+  const ts = new Date();
+  const hh = String(ts.getHours()).padStart(2, "0");
+  const mm = String(ts.getMinutes()).padStart(2, "0");
+  const ss = String(ts.getSeconds()).padStart(2, "0");
+  const ms = String(ts.getMilliseconds()).padStart(3, "0");
+  row.innerHTML =
+    `<span class="log-ts">${hh}:${mm}:${ss}.${ms}</span>` +
+    `<span class="log-tag">${tag}</span>` +
+    `<span class="log-msg"></span>`;
+  row.querySelector(".log-msg").textContent = msg;
+  body.appendChild(row);
+  while (body.childElementCount > MAX_LOG_ENTRIES) body.removeChild(body.firstChild);
+  body.scrollTop = body.scrollHeight;
+
+  logState.count++;
+  if (level === "err") logState.errorCount++;
+  else if (level === "warn") logState.warnCount++;
+  updateLogBadge();
+}
+
+function updateLogBadge() {
+  const badge = $("logBadge");
+  if (!badge) return;
+  badge.textContent = String(logState.count);
+  badge.classList.remove("has-error", "has-warn");
+  if (logState.errorCount > 0) badge.classList.add("has-error");
+  else if (logState.warnCount > 0) badge.classList.add("has-warn");
+}
+
+function clearLog() {
+  const body = $("logBody");
+  if (body) body.innerHTML = "";
+  logState.count = 0;
+  logState.errorCount = 0;
+  logState.warnCount = 0;
+  logState.lastProgressIter = -1;
+  logState.progressBatched = 0;
+  updateLogBadge();
+}
+
+function setupLogPanel() {
+  const panel = $("logPanel");
+  const header = panel?.querySelector(".log-header");
+  const toggleBtn = $("logToggleBtn");
+  const clearBtn = $("logClearBtn");
+  if (!panel) return;
+  const toggle = () => {
+    panel.classList.toggle("collapsed");
+    if (toggleBtn) toggleBtn.textContent = panel.classList.contains("collapsed") ? "Expand" : "Collapse";
+  };
+  header?.addEventListener("click", (e) => {
+    if (e.target.closest("button")) return;
+    toggle();
+  });
+  toggleBtn?.addEventListener("click", (e) => { e.stopPropagation(); toggle(); });
+  clearBtn?.addEventListener("click", (e) => { e.stopPropagation(); clearLog(); });
+  // Start expanded the first time so the user sees it.
+  panel.classList.remove("collapsed");
+  if (toggleBtn) toggleBtn.textContent = "Collapse";
+  // Capture uncaught errors.
+  window.addEventListener("error", (e) => log("err", "js", `${e.message} @ ${e.filename}:${e.lineno}`));
+  window.addEventListener("unhandledrejection", (e) =>
+    log("err", "js", `unhandled: ${e.reason?.message || e.reason}`));
+  log("info", "init", "Activity log ready.");
+}
+
 function fmt(n, digits = 6) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
   if (!Number.isFinite(n)) return String(n);
@@ -63,6 +140,8 @@ function fmt(n, digits = 6) {
 
 // ───────────────── API ─────────────────
 async function apiJson(path, body) {
+  log("info", "api", `POST ${path}`);
+  const t0 = performance.now();
   const res = await fetch(API + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -70,13 +149,18 @@ async function apiJson(path, body) {
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
+    log("err", "api", `${path} → ${res.status} ${res.statusText}: ${txt.slice(0, 200)}`);
     throw new Error(`${res.status} ${res.statusText}: ${txt}`);
   }
-  return res.json();
+  const json = await res.json();
+  log("ok", "api", `${path} → 200 in ${(performance.now() - t0).toFixed(0)}ms`);
+  return json;
 }
 
 // SSE-over-POST stream parser. Calls onProgress(point) and returns the final result.
 async function apiStreamCalibrate(body, signal, onProgress) {
+  log("info", "sse", "POST /api/calibrate/stream — opening stream");
+  const t0 = performance.now();
   const res = await fetch(API + "/api/calibrate/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
@@ -85,12 +169,15 @@ async function apiStreamCalibrate(body, signal, onProgress) {
   });
   if (!res.ok || !res.body) {
     const txt = await res.text().catch(() => "");
+    log("err", "sse", `${res.status} ${res.statusText}: ${txt.slice(0, 200)}`);
     throw new Error(`${res.status} ${res.statusText}: ${txt}`);
   }
+  log("ok", "sse", `connected (status=${res.status})`);
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
   let finalResult = null;
+  let progressCount = 0;
 
   while (true) {
     const { value, done } = await reader.read();
@@ -111,16 +198,38 @@ async function apiStreamCalibrate(body, signal, onProgress) {
       }
       if (dataLines.length === 0) continue;
       let payload;
-      try { payload = JSON.parse(dataLines.join("\n")); } catch { continue; }
-      if (event === "progress") onProgress(payload);
-      else if (event === "done") finalResult = payload;
-      else if (event === "error") {
+      try {
+        payload = JSON.parse(dataLines.join("\n"));
+      } catch (e) {
+        log("err", "sse", `JSON parse failed: ${e.message}`);
+        continue;
+      }
+      if (event === "started") {
+        log("info", "started",
+          `source=${payload.source} spot=${payload.spot} grid=${payload.expiries}×${payload.strikes} ` +
+          `pipeline=${payload.globalMethod}/${payload.gradientMethod}`);
+      } else if (event === "progress") {
+        progressCount++;
+        // Log every frame at low rate, then batch above 50.
+        if (progressCount <= 20 || progressCount % 25 === 0) {
+          log("event", `iter ${payload.iter}`,
+            `${payload.stage} rmse=${payload.rmse?.toExponential ? payload.rmse.toExponential(4) : payload.rmse}`);
+        }
+        onProgress(payload);
+      } else if (event === "done") {
+        finalResult = payload;
+        log("ok", "sse", `done event received (${progressCount} progress frames, ${(performance.now() - t0).toFixed(0)}ms)`);
+      } else if (event === "error") {
         const msg = payload?.message || "Calibration failed.";
         const type = payload?.type ? ` (${payload.type})` : "";
+        log("err", "sse", `server error: ${msg}${type}`);
         throw new Error(msg + type);
+      } else {
+        log("warn", "sse", `unknown event "${event}"`);
       }
     }
   }
+  log("info", "sse", `stream closed (final=${finalResult ? "yes" : "no"})`);
   return finalResult;
 }
 
@@ -1031,6 +1140,7 @@ function switchTab(name) {
 
 // ───────────────── Wiring ─────────────────
 function wireUi() {
+  setupLogPanel();
   $("loadSurfaceBtn").addEventListener("click", loadSurface);
   $("runBtn").addEventListener("click", runCalibration);
   $("cancelBtn").addEventListener("click", cancelCalibration);

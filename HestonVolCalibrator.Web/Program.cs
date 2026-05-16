@@ -114,6 +114,22 @@ app.MapPost("/api/calibrate/stream", async (HttpContext ctx, CalibrateApiRequest
     ctx.Response.Headers["Cache-Control"] = "no-cache";
     ctx.Response.Headers["X-Accel-Buffering"] = "no";
 
+    // Emit a "started" frame immediately so the client knows the stream is open
+    // and gets surface stats up front. On large market grids the first iteration
+    // can take many seconds; without this frame the UI appears frozen.
+    var startedPayload = JsonSerializer.Serialize(new
+    {
+        ticker = req.Ticker,
+        source = cached.Source,
+        spot = cached.Spot,
+        expiries = cached.Expiries.Length,
+        strikes = cached.Strikes.Length,
+        globalMethod = req.GlobalMethod.ToString(),
+        gradientMethod = req.GradientMethod.ToString(),
+    }, jsonOpts);
+    await ctx.Response.WriteAsync($"event: started\ndata: {startedPayload}\n\n", ct);
+    await ctx.Response.Body.FlushAsync(ct);
+
     var channel = Channel.CreateUnbounded<ConvergencePoint>(new UnboundedChannelOptions
     {
         SingleReader = true,

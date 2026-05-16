@@ -36,7 +36,7 @@ public static class Program
         {
             Console.WriteLine("Attempting live Yahoo Finance fetch...");
             using var loader = new YahooOptionsLoader();
-            (spot, rawQuotes) = await loader.LoadSpxAsync(maxExpiries: 6);
+            (spot, rawQuotes) = await loader.LoadAsync("^SPX", maxExpiries: 6);
             Console.WriteLine($"Live fetch OK. spot={spot}, raw quotes={rawQuotes.Count}");
         }
         catch (Exception ex)

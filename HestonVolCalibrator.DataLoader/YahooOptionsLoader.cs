@@ -18,7 +18,7 @@ namespace HestonVolCalibrator.DataLoader
         int Volume,
         bool IsCall);
 
-    // Fetches SPX options chain from Yahoo Finance using the v7 API with crumb authentication.
+    // Fetches an options chain from Yahoo Finance using the v7 API with crumb authentication.
     public class YahooOptionsLoader : IDisposable
     {
         private readonly HttpClient _http;
@@ -43,26 +43,30 @@ namespace HestonVolCalibrator.DataLoader
             _http.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.9");
         }
 
-        // Returns (spot, quotes) for SPX.
+        // Returns (spot, quotes) for the requested ticker (e.g. "^SPX", "AAPL", "^NDX").
         // minMaturity / maxMaturity bound time-to-expiry (years); expiries outside are skipped before HTTP fetch.
-        public async Task<(double spot, List<OptionQuote> quotes)> LoadSpxAsync(
+        public async Task<(double spot, List<OptionQuote> quotes)> LoadAsync(
+            string ticker,
             int maxExpiries = 6,
             double minMaturity = 0.0,
             double maxMaturity = double.PositiveInfinity)
         {
+            if (string.IsNullOrWhiteSpace(ticker))
+                throw new ArgumentException("Ticker is required.", nameof(ticker));
+
             await EnsureCrumbAsync();
 
-            string symbol = "%5ESPX"; // ^SPX URL-encoded
+            string symbol = Uri.EscapeDataString(ticker.Trim());
             string baseUrl = $"https://query1.finance.yahoo.com/v7/finance/options/{symbol}";
             string crumbParam = _crumb is not null ? $"&crumb={Uri.EscapeDataString(_crumb)}" : "";
 
             JsonDocument? baseDoc = await FetchJsonAsync(baseUrl + "?" + crumbParam.TrimStart('&'));
             if (baseDoc is null)
-                throw new Exception("Failed to fetch SPX options page after crumb authentication.");
+                throw new Exception($"Failed to fetch options page for {ticker} after crumb authentication.");
 
             double spot = ParseSpot(baseDoc);
             long[] expiries = ParseExpiryDates(baseDoc);
-            Console.WriteLine($"  SPX spot: {spot:F2}");
+            Console.WriteLine($"  {ticker} spot: {spot:F2}");
             string capLabel = maxExpiries > 0 ? maxExpiries.ToString() : "unlimited";
             Console.WriteLine($"  Available expiries: {expiries.Length}  " +
                               $"(maturity window [{minMaturity:F3}, {maxMaturity:F3}]y, cap {capLabel})");

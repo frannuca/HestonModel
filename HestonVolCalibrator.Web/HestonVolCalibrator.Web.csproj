@@ -9,4 +9,7 @@
     <ProjectReference Include="..\HestonVolCalibrator\HestonVolCalibrator.csproj" />
     <ProjectReference Include="..\HestonVolCalibrator.DataLoader\HestonVolCalibrator.DataLoader.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.8" />
+  </ItemGroup>
 </Project>

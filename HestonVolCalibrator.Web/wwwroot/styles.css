@@ -570,3 +570,67 @@ body { padding-bottom: 60px; } /* leave room for the docked log */
   z-index: 3;
 }
 .greeks-table td.null-cell { color: var(--text-dim); }
+
+/* ── Modal overlay ──────────────────────────────────────────── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.modal-box {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 22px;
+  min-width: 320px;
+  max-width: 520px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+}
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.modal-header h3 { margin: 0; font-size: 15px; }
+
+/* ── SABR calibration cube table ───────────────────────────── */
+.calib-cube-table {
+  border-collapse: collapse;
+  font-size: 0.8em;
+  width: 100%;
+  min-width: 400px;
+}
+.calib-cube-table th,
+.calib-cube-table td {
+  border: 1px solid var(--border);
+  padding: 5px 9px;
+  text-align: center;
+  white-space: nowrap;
+}
+.calib-cube-table th {
+  background: var(--bg-elev);
+  color: var(--text-dim);
+  font-weight: 600;
+}
+.calib-cube-table .cube-expiry {
+  background: var(--bg-elev);
+  color: var(--text-dim);
+  font-weight: 600;
+  text-align: left;
+}
+.calib-cube-table .cube-cell {
+  cursor: pointer;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  transition: background 0.12s;
+}
+.calib-cube-table .cube-cell:hover { background: rgba(79,157,255,0.12); }
+.calib-cube-table .cube-cell.conv .conv-flag { color: var(--good); }
+.calib-cube-table .cube-cell.noconv { background: rgba(242,162,16,0.08); }
+.calib-cube-table .cube-cell.noconv .conv-flag { color: var(--warn); }
+.calib-cube-table .cube-empty { color: var(--text-dim); }

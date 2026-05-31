@@ -208,6 +208,13 @@
             <label for="marketCutExpiry">Expiry</label>
             <select id="marketCutExpiry" disabled></select>
           </div>
+          <div class="control">
+            <label>X axis</label>
+            <div class="qty-toggles">
+              <label class="mode-toggle"><input type="radio" name="smileXAxis" value="strike" checked /> Strike</label>
+              <label class="mode-toggle"><input type="radio" name="smileXAxis" value="delta" /> Delta</label>
+            </div>
+          </div>
         </div>
         <div id="plot-market-cut" class="plot market-cut-plot"></div>
       </div>
@@ -349,6 +356,249 @@
     </div>
   </section>
 
+  <section id="swaptionPanel" class="card">
+    <div class="card-header collapsible">
+      <h2>Swaption Vol Surface</h2>
+      <button id="toggleSwaptionBtn" class="ghost" type="button">Collapse</button>
+    </div>
+    <div id="swaptionBody">
+      <!-- Source selector row -->
+      <div class="control-row" style="align-items:flex-end">
+        <div class="control" style="flex:3">
+          <label for="swaptionSourceSel">Surface source</label>
+          <select id="swaptionSourceSel">
+            <option value="fred">— Source from FRED —</option>
+          </select>
+        </div>
+        <div class="control">
+          <button id="loadSwaptionBtn" class="primary">Load surface</button>
+        </div>
+        <div id="swaptionStatus" class="status-pill"></div>
+      </div>
+
+      <!-- FRED configuration (hidden when a DB surface is selected) -->
+      <div id="swaptionFredConfig" class="control-row" style="margin-top:6px">
+        <div class="control" style="flex:2">
+          <label for="swaptionExpiries">Option expiries (yr)</label>
+          <input id="swaptionExpiries" type="text" value="0.25,0.5,1,2,5,10" style="width:100%" />
+        </div>
+        <div class="control" style="flex:2">
+          <label for="swaptionTenors">Swap tenors (yr)</label>
+          <input id="swaptionTenors" type="text" value="1,2,5,10,30" style="width:100%" />
+        </div>
+        <div class="control" style="flex:2">
+          <label for="swaptionOffsets">Strike offsets (bps)</label>
+          <input id="swaptionOffsets" type="text" value="-200,-100,-50,0,50,100,200" style="width:100%" />
+        </div>
+        <div class="control">
+          <label for="swaptionAsOf">As-of date (blank = today)</label>
+          <input id="swaptionAsOf" type="text" placeholder="YYYY-MM-DD" />
+        </div>
+        <div class="control checkbox">
+          <label><input id="swaptionForceSynthetic" type="checkbox" /> Use synthetic data</label>
+        </div>
+      </div>
+
+      <div id="swaptionInfo" class="hidden">
+        <div class="control-row" style="margin-top:8px">
+          <div id="swaptionSourcePill" class="status-pill"></div>
+        </div>
+        <div id="plot-swaption-heatmap" class="plot"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── SABR Calibration ────────────────────────────────────────── -->
+  <section id="sabrCalibPanel" class="card">
+    <div class="card-header collapsible">
+      <h2>SABR Calibration</h2>
+      <button id="toggleSabrCalibBtn" class="ghost" type="button">Collapse</button>
+    </div>
+    <div id="sabrCalibBody">
+      <div id="sabrSurfaceInfo" class="hidden" style="margin-bottom:8px">
+        <div id="sabrSurfaceInfoPill" class="status-pill"></div>
+      </div>
+      <div class="control-row">
+        <div class="control">
+          <label for="sabrCalibBeta">Beta (&beta;)</label>
+          <input id="sabrCalibBeta" type="number" value="0" step="0.1" min="0" max="1" />
+        </div>
+        <div class="control checkbox">
+          <label><input id="sabrCalibFixBeta" type="checkbox" checked /> Fix &beta;</label>
+        </div>
+        <div class="control">
+          <label for="sabrCalibConvention">Convention</label>
+          <select id="sabrCalibConvention">
+            <option value="Normal" selected>Normal (bps)</option>
+            <option value="Lognormal">Lognormal</option>
+          </select>
+        </div>
+        <div class="control">
+          <button id="sabrCalibBtn" class="primary">Calibrate all slices</button>
+        </div>
+        <div class="control">
+          <button id="sabrSaveDbBtn" class="ghost" type="button" disabled>Save to DB</button>
+        </div>
+        <div id="sabrCalibStatus" class="status-pill"></div>
+      </div>
+      <div id="sabrCalibCubeWrap" class="hidden" style="overflow-x:auto;margin-top:14px"></div>
+    </div>
+  </section>
+
+  <!-- ── Smile Plots ───────────────────────────────────────────── -->
+  <section id="sabrSmilePlotsPanel" class="card hidden">
+    <div class="card-header collapsible">
+      <h2>Smile Plots</h2>
+      <button id="toggleSabrSmilesBtn" class="ghost" type="button">Collapse</button>
+    </div>
+    <div id="sabrSmilesBody">
+      <div class="control-row" style="margin-bottom:10px">
+        <div class="control">
+          <label for="smilePlotsTenorSel">Swap tenor</label>
+          <select id="smilePlotsTenorSel"></select>
+        </div>
+        <div id="sabrSmilesInfo" class="status-pill"></div>
+      </div>
+      <div id="sabrSmilePlotsGrid" class="smiles-grid"></div>
+    </div>
+  </section>
+
+  <!-- ── Smile Interpolation ──────────────────────────────────── -->
+  <section id="sabrInterpPanel" class="card hidden">
+    <div class="card-header collapsible">
+      <h2>Smile Interpolation</h2>
+      <button id="toggleSabrInterpBtn" class="ghost" type="button">Collapse</button>
+    </div>
+    <div id="sabrInterpBody">
+      <div class="control-row">
+        <div class="control">
+          <label for="sabrInterpTenorSel">Swap tenor</label>
+          <select id="sabrInterpTenorSel"></select>
+        </div>
+        <div class="control">
+          <label for="sabrInterpExpiry">Target expiry (yr)</label>
+          <input id="sabrInterpExpiry" type="number" value="1.5" step="0.25" min="0.01" />
+        </div>
+        <div class="control">
+          <label for="sabrInterpStrikeMin">Strike min (%)</label>
+          <input id="sabrInterpStrikeMin" type="number" value="2" step="0.25" />
+        </div>
+        <div class="control">
+          <label for="sabrInterpStrikeMax">Strike max (%)</label>
+          <input id="sabrInterpStrikeMax" type="number" value="7" step="0.25" />
+        </div>
+        <div class="control">
+          <label for="sabrInterpPoints">Points</label>
+          <input id="sabrInterpPoints" type="number" value="60" step="5" min="5" max="300" />
+        </div>
+        <div class="control">
+          <button id="sabrInterpBtn" class="primary">Compute smile</button>
+        </div>
+        <div id="sabrInterpStatus" class="status-pill"></div>
+      </div>
+      <div id="plot-sabr-interp" class="plot"></div>
+      <div class="control-row" style="margin-top:10px">
+        <div class="control">
+          <label for="sabrGreeksAnnuity">Annuity</label>
+          <input id="sabrGreeksAnnuity" type="number" value="1" step="0.001" min="0.001" style="width:90px" />
+        </div>
+        <div class="control checkbox">
+          <label><input id="sabrGreeksIsPayer" type="checkbox" checked /> Payer</label>
+        </div>
+        <div class="control">
+          <button id="sabrGreeksBtn" class="ghost" type="button">Compute Greeks</button>
+        </div>
+        <div id="sabrGreeksStatus" class="status-pill"></div>
+      </div>
+      <div id="sabrGreeksTableWrap"></div>
+    </div>
+  </section>
+
+  <!-- ── SABR params popup modal ──────────────────────────────── -->
+  <div id="sabrParamsModal" class="modal-overlay hidden">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 id="sabrModalTitle">SABR Parameters</h3>
+        <button class="ghost" id="sabrModalCloseBtn" style="font-size:1.3em;line-height:1;padding:4px 10px">×</button>
+      </div>
+      <table class="results-table" style="width:100%;margin-top:8px">
+        <thead><tr><th>Parameter</th><th>Value</th></tr></thead>
+        <tbody id="sabrModalTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ── Database / History panel ────────────────────────────── -->
+  <section id="dbPanel" class="card">
+    <div class="card-header collapsible">
+      <h2>Database</h2>
+      <button id="toggleDbBtn" class="ghost" type="button">Collapse</button>
+    </div>
+    <div id="dbBody">
+      <div class="grid two-cols">
+
+        <!-- Swaption surface history -->
+        <div class="col">
+          <h3>Swaption surfaces</h3>
+          <div class="control-row">
+            <button id="dbSaveSwaptionBtn" class="primary" type="button">Save current surface</button>
+            <button id="dbRefreshSwaptionBtn" class="ghost" type="button">Refresh list</button>
+            <div id="dbSwaptionStatus" class="status-pill"></div>
+          </div>
+          <div style="overflow-x:auto;margin-top:8px">
+            <table class="results-table" style="width:100%;font-size:0.82em">
+              <thead>
+                <tr>
+                  <th>ID</th><th>As of</th><th>Source</th>
+                  <th>Expiries</th><th>Tenors</th><th>Cells</th>
+                  <th>Saved</th><th></th>
+                </tr>
+              </thead>
+              <tbody id="dbSwaptionTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Heston surface history -->
+        <div class="col">
+          <h3>Heston surfaces &amp; calibrations</h3>
+          <div class="control-row">
+            <button id="dbSaveHestonBtn" class="primary" type="button">Save current surface</button>
+            <button id="dbRefreshHestonBtn" class="ghost" type="button">Refresh list</button>
+            <div id="dbHestonStatus" class="status-pill"></div>
+          </div>
+          <div style="overflow-x:auto;margin-top:8px">
+            <table class="results-table" style="width:100%;font-size:0.82em">
+              <thead>
+                <tr>
+                  <th>ID</th><th>Ticker</th><th>Spot</th>
+                  <th>Expiries</th><th>Strikes</th><th>Source</th>
+                  <th>Saved</th><th></th>
+                </tr>
+              </thead>
+              <tbody id="dbHestonTableBody"></tbody>
+            </table>
+          </div>
+
+          <h3 style="margin-top:14px">Calibrated Heston parameters</h3>
+          <div style="overflow-x:auto">
+            <table class="results-table" style="width:100%;font-size:0.82em">
+              <thead>
+                <tr>
+                  <th>Surf ID</th><th>Ticker</th><th>As of</th>
+                  <th>&kappa;</th><th>&theta;</th><th>&sigma;</th>
+                  <th>&rho;</th><th>v&#8320;</th><th>RMSE</th><th>Saved</th>
+                </tr>
+              </thead>
+              <tbody id="dbHestonCalibTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
   <footer class="app-footer">
     <span>Heston calibration UI &middot; Plotly 3D &middot; vanilla JS</span>
   </footer>
@@ -365,6 +615,6 @@
     <div id="logBody" class="log-body"></div>
   </section>
 
-  <script type="module" src="app.js"></script>
+  <script type="module" src="app.js?v=13"></script>
 </body>
 </html>

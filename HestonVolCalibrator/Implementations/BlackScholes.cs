@@ -63,22 +63,25 @@ namespace HestonVolCalibrator.Implementations
             return strike * System.Math.Exp(-rate * maturity) * NormalCdf(-d2) - spot * NormalCdf(-d1);
         }
 
-        // Call delta
-        public static double CallDelta(double spot, double strike, double vol, double maturity, double rate = 0.0)
+        // Call delta with continuous dividend yield q. Without q, delta is on the wrong forward
+        // when pricing an underlying that pays carry (e.g. SPX index ~1.3% q). The Heston pricer
+        // already takes q, so the BS-equivalent delta we attach to surface cells must too.
+        public static double CallDelta(double spot, double strike, double vol, double maturity, double rate = 0.0, double dividendYield = 0.0)
         {
             if (maturity <= 0)
                 return spot > strike ? 1.0 : 0.0;
             if (vol <= 0)
                 return spot > strike ? 1.0 : 0.0;
 
-            double d1 = (System.Math.Log(spot / strike) + (rate + 0.5 * vol * vol) * maturity) / (vol * System.Math.Sqrt(maturity));
-            return NormalCdf(d1);
+            double sqrtT = System.Math.Sqrt(maturity);
+            double d1 = (System.Math.Log(spot / strike) + (rate - dividendYield + 0.5 * vol * vol) * maturity) / (vol * sqrtT);
+            return System.Math.Exp(-dividendYield * maturity) * NormalCdf(d1);
         }
 
-        // Put delta
-        public static double PutDelta(double spot, double strike, double vol, double maturity, double rate = 0.0)
+        // Put delta — standard put-call parity for delta: Δ_put = Δ_call - e^{-qT}.
+        public static double PutDelta(double spot, double strike, double vol, double maturity, double rate = 0.0, double dividendYield = 0.0)
         {
-            return CallDelta(spot, strike, vol, maturity, rate) - 1.0;
+            return CallDelta(spot, strike, vol, maturity, rate, dividendYield) - System.Math.Exp(-dividendYield * maturity);
         }
 
         // Convert delta to strike (inverse of delta function)

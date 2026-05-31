@@ -152,8 +152,11 @@ async function apiJson(path, body) {
   });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
-    log("err", "api", `${path} → ${res.status} ${res.statusText}: ${txt.slice(0, 200)}`);
-    throw new Error(`${res.status} ${res.statusText}: ${txt}`);
+    // Extract clean message from ProblemDetails JSON if present; else use raw text.
+    let msg = txt;
+    try { const p = JSON.parse(txt); if (p.detail || p.title) msg = p.detail || p.title; } catch { /**/ }
+    log("err", "api", `${path} → ${res.status}: ${msg.slice(0, 200)}`);
+    throw new Error(msg || `${res.status} ${res.statusText}`);
   }
   const json = await res.json();
   log("ok", "api", `${path} → 200 in ${(performance.now() - t0).toFixed(0)}ms`);
@@ -604,7 +607,91 @@ function refreshMarketCutControls() {
   sel.value = "0";
 }
 
-function renderMarketCut() {
+// Reads the global Strike / Delta toggle that drives all smile-style x-axes
+// (market cut, Smiles tab tiles, single-expiry detail). Defaults to "strike"
+// if the radio group isn't yet in the DOM.
+function getSmileXAxis() {
+  return document.querySelector('input[name="smileXAxis"]:checked')?.value || "strike";
+}
+
+// ───────────────── Heston delta-axis cache ─────────────────
+// The strike→delta transformation is model-derived: for each (T, K) we ask Heston for
+// a price, invert to BS IV, then compute BS delta from that IV. We cache the result in
+// memory keyed by (calibration stamp + strike list + maturity list) so toggling between
+// strike and delta axes — and switching expiries — doesn't hit the server repeatedly.
+state.hestonDelta = state.hestonDelta || { stamp: null, byKey: new Map() };
+
+function calibrationStamp() {
+  const c = state.calibration;
+  if (!c) return null;
+  const p = c.hestonParams || c.params;
+  if (!p) return null;
+  // Anything that changes the model fingerprint goes here. RMSE pins the same iteration
+  // count to a deterministic stamp; spot/rate/q are shared across requests but included
+  // for safety (a snapshot load can carry different ones).
+  return [
+    p.kappa, p.theta, p.sigma, p.rho, p.v0,
+    state.surface?.spot, surfaceRiskFreeRate(), surfaceDividendYield(),
+    c.finalRmse, c.totalIterations
+  ].join("|");
+}
+function hashArr(arr) {
+  // Tiny deterministic fingerprint — first/last/length/sum — avoids serialising long arrays.
+  if (!Array.isArray(arr) || arr.length === 0) return "0";
+  let s = 0;
+  for (const v of arr) s += v;
+  return `${arr.length}:${arr[0]}:${arr[arr.length - 1]}:${s}`;
+}
+
+// Pulls (iv, delta) for the requested (maturity[], strikes[]) grid. Returns from cache when
+// possible; otherwise POSTs /api/heston-delta. Caller receives { iv: [[..]], delta: [[..]] }
+// shape (nMat × nStrikes). Returns null if there's no calibration to base it on.
+async function fetchHestonDelta(maturities, strikes) {
+  const stamp = calibrationStamp();
+  if (!stamp) return null;
+  if (state.hestonDelta.stamp !== stamp) {
+    // Calibration changed — drop all cached deltas. Heston params shifted; old deltas are stale.
+    state.hestonDelta = { stamp, byKey: new Map() };
+  }
+  const key = `${hashArr(maturities)}|${hashArr(strikes)}`;
+  if (state.hestonDelta.byKey.has(key)) return state.hestonDelta.byKey.get(key);
+
+  const c = state.calibration;
+  const cparams = c.hestonParams || c.params;
+  const body = {
+    params: cparams,
+    spot: state.surface.spot,
+    riskFreeRate: surfaceRiskFreeRate(),
+    dividendYield: surfaceDividendYield(),
+    strikes,
+    maturities,
+  };
+  const res = await apiJson("/api/heston-delta", body);
+  state.hestonDelta.byKey.set(key, res);
+  return res;
+}
+
+// Last successful delta grid for the *market* surface's (expiries, strikes) — used by the
+// market-cut and Smiles tab tiles. Pre-fetched on toggle / on calibration so that successive
+// expiry switches don't refetch.
+state.marketDeltaGrid = state.marketDeltaGrid || { stamp: null, delta: null, iv: null };
+async function ensureMarketSurfaceDeltaGrid() {
+  if (!state.calibration || !state.surface) return null;
+  const stamp = calibrationStamp();
+  if (state.marketDeltaGrid.stamp === stamp && state.marketDeltaGrid.delta) return state.marketDeltaGrid;
+  const r = await fetchHestonDelta(state.surface.expiries, state.surface.strikes);
+  if (!r) return null;
+  state.marketDeltaGrid = { stamp, delta: r.delta, iv: r.iv };
+  return state.marketDeltaGrid;
+}
+function marketDeltaRow(idx) {
+  const g = state.marketDeltaGrid;
+  if (!g || !Array.isArray(g.delta) || idx < 0 || idx >= g.delta.length) return null;
+  const row = g.delta[idx];
+  return Array.isArray(row) ? row.map(v => (v === null || v === undefined || !Number.isFinite(v)) ? null : v) : null;
+}
+
+async function renderMarketCut() {
   const surf = state.surface;
   if (!surf) return;
   const sel = $("marketCutExpiry");
@@ -618,13 +705,32 @@ function renderMarketCut() {
   const idx = Math.max(0, Math.min(surf.expiries.length - 1, parseInt(sel.value, 10) || 0));
   const T = surf.expiries[idx];
 
-  const xs = surf.strikes.slice();
   const cleanRow = (row) => (row || []).map((v) =>
     (v === null || v === undefined || !Number.isFinite(v)) ? null : v
   );
   const ivY   = cleanRow(surf.iv && surf.iv[idx]);
   const callY = cleanRow(surf.callPrice && surf.callPrice[idx]);
   const putY  = cleanRow(surf.putPrice && surf.putPrice[idx]);
+
+  // Delta axis is Heston-derived: ask /api/heston-delta for BS delta at each market strike
+  // using the calibrated model. Falls back to strike when no calibration exists yet.
+  const wantDelta = getSmileXAxis() === "delta";
+  let deltaRow = null;
+  if (wantDelta) {
+    if (!state.calibration) {
+      log("warn", "smile", "delta axis requires a calibration — falling back to strike");
+    } else {
+      try {
+        await ensureMarketSurfaceDeltaGrid();
+        deltaRow = marketDeltaRow(idx);
+      } catch (e) {
+        log("err", "smile", `delta fetch failed: ${e.message}`);
+      }
+    }
+  }
+  const useDelta = wantDelta && Array.isArray(deltaRow);
+  const xs = useDelta ? deltaRow : surf.strikes.slice();
+  const xTitle = useDelta ? "Delta (call, Heston)" : "Strike";
 
   const traces = [
     {
@@ -637,41 +743,35 @@ function renderMarketCut() {
       marker: { color: COLORS.iv, size: 5 },
       line: { color: COLORS.iv, width: 1 },
     },
-    {
-      x: xs, y: callY,
-      mode: "lines+markers",
-      type: "scatter",
-      name: "Call Price",
-      yaxis: "y2",
-      connectgaps: false,
-      marker: { color: COLORS.call, size: 5 },
-      line: { color: COLORS.call, width: 1 },
-    },
-    {
-      x: xs, y: putY,
-      mode: "lines+markers",
-      type: "scatter",
-      name: "Put Price",
-      yaxis: "y2",
-      connectgaps: false,
-      marker: { color: COLORS.put, size: 5 },
-      line: { color: COLORS.put, width: 1 },
-    },
   ];
+  // Price traces only make sense against strike. Hide them when the user selects delta —
+  // call/put price as a function of delta is monotonic but information-poor, and overlaying
+  // makes the IV-smile shape harder to read.
+  if (!useDelta) {
+    traces.push(
+      {
+        x: xs, y: callY,
+        mode: "lines+markers", type: "scatter", name: "Call Price", yaxis: "y2",
+        connectgaps: false, marker: { color: COLORS.call, size: 5 }, line: { color: COLORS.call, width: 1 },
+      },
+      {
+        x: xs, y: putY,
+        mode: "lines+markers", type: "scatter", name: "Put Price", yaxis: "y2",
+        connectgaps: false, marker: { color: COLORS.put, size: 5 }, line: { color: COLORS.put, width: 1 },
+      },
+    );
+  }
+
   const layout = {
     title: { text: `${surf.ticker} cut @ T = ${T.toFixed(3)}y`, font: { size: 14 } },
     margin: { t: 44, l: 60, r: 60, b: 50 },
     paper_bgcolor: "#1e2630",
     plot_bgcolor: "#1e2630",
     font: { color: "#e7ecf2" },
-    xaxis: { title: "Strike", gridcolor: "#2a3340" },
+    xaxis: { title: xTitle, gridcolor: "#2a3340", autorange: useDelta ? "reversed" : true },
     yaxis: { title: "IV", gridcolor: "#2a3340", side: "left" },
-    yaxis2: {
-      title: "Price",
-      gridcolor: "#2a3340",
-      overlaying: "y",
-      side: "right",
-      showgrid: false,
+    yaxis2: useDelta ? undefined : {
+      title: "Price", gridcolor: "#2a3340", overlaying: "y", side: "right", showgrid: false,
     },
     showlegend: true,
     legend: { x: 1, xanchor: "right", y: 1 },
@@ -810,7 +910,7 @@ async function fetchDenseHestonSmiles(res) {
   state.smiles = { denseStrikes, denseIv: out.iv };
 }
 
-function renderSmiles() {
+async function renderSmiles() {
   const grid = $("smilesGrid");
   const status = $("smilesStatus");
   if (!grid) return;
@@ -835,6 +935,28 @@ function renderSmiles() {
     console.warn("renderSmiles: empty surface grid");
     return;
   }
+  const wantDelta = getSmileXAxis() === "delta";
+  const useDeltaPossible = wantDelta && !!cal;
+  if (wantDelta && !cal) log("warn", "smile", "delta axis requires a calibration — falling back to strike");
+
+  // Pre-fetch market-strike delta grid + (optionally) dense-strike delta grid in one go
+  // so per-tile rendering stays synchronous below.
+  let marketDelta = null;
+  let denseDelta = null;
+  if (useDeltaPossible) {
+    try {
+      const m = await ensureMarketSurfaceDeltaGrid();
+      marketDelta = m?.delta || null;
+      if (dense && dense.denseStrikes) {
+        const r = await fetchHestonDelta(surf.expiries, dense.denseStrikes);
+        denseDelta = r?.delta || null;
+      }
+    } catch (e) {
+      log("err", "smile", `Heston delta fetch failed: ${e.message}`);
+    }
+  }
+  const xTitle = (useDeltaPossible && marketDelta) ? "Delta (Heston)" : "Strike";
+
   surf.expiries.forEach((t, i) => {
     const cellId = `smile-tile-${i}`;
     const div = document.createElement("div");
@@ -842,13 +964,16 @@ function renderSmiles() {
     div.id = cellId;
     grid.appendChild(div);
 
-    // Market trace (markers + thin connecting line; gaps preserved as nulls).
-    const mktX = surf.strikes.slice();
+    // Market trace x-array. With delta selected and a calibration in place, use the
+    // pre-fetched Heston delta at the market strikes; otherwise stay on strike.
     const ivRow = (surf.iv && surf.iv[i]) ? surf.iv[i] : [];
-    const mktY = mktX.map((_, j) => {
-      const v = ivRow[j];
-      return (v === null || v === undefined || !Number.isFinite(v)) ? null : v;
-    });
+    const mktDeltaRow = (useDeltaPossible && Array.isArray(marketDelta) && Array.isArray(marketDelta[i]))
+      ? marketDelta[i].map(v => (v === null || v === undefined || !Number.isFinite(v)) ? null : v)
+      : null;
+    const useDelta = useDeltaPossible && Array.isArray(mktDeltaRow);
+    const mktX = useDelta ? mktDeltaRow : surf.strikes.slice();
+    const mktY = (Array.isArray(ivRow) ? ivRow : []).map((v) =>
+      (v === null || v === undefined || !Number.isFinite(v)) ? null : v);
 
     const traces = [
       {
@@ -865,13 +990,28 @@ function renderSmiles() {
 
     if (cal) {
       let hesX = null, hesY = null;
-      if (dense && dense.denseStrikes && dense.denseIv && dense.denseIv[i]) {
-        hesX = dense.denseStrikes;
-        hesY = dense.denseIv[i].map((v) => (v === null || v === undefined || !Number.isFinite(v)) ? null : v);
-      } else if (cal.strikes && cal.hestonIv && cal.hestonIv[i]) {
-        // Fallback: use market-grid Heston IV from the calibration result.
-        hesX = cal.strikes;
-        hesY = cal.hestonIv[i].map((v) => (v === null || v === undefined || !Number.isFinite(v)) ? null : v);
+      if (useDelta) {
+        // Heston curve in delta-IV space: server returned (iv, delta) for the dense or
+        // market strike set in this batch, so we read both from the cached response.
+        if (dense && dense.denseStrikes && dense.denseIv && dense.denseIv[i] && Array.isArray(denseDelta) && Array.isArray(denseDelta[i])) {
+          hesY = dense.denseIv[i].map((v) => (v === null || v === undefined || !Number.isFinite(v)) ? null : v);
+          hesX = denseDelta[i].map((v) => (v === null || v === undefined || !Number.isFinite(v)) ? null : v);
+        } else if (cal.strikes && cal.hestonIv && cal.hestonIv[i] && Array.isArray(marketDelta) && Array.isArray(marketDelta[i])) {
+          // Fallback when the dense grid hasn't been fetched yet (e.g. before the Smiles
+          // tab has run its dense pre-fetch). Reuse the market-grid Heston IV from the
+          // calibration result and the corresponding deltas we pulled into marketDelta.
+          hesY = cal.hestonIv[i].map((v) => (v === null || v === undefined || !Number.isFinite(v)) ? null : v);
+          hesX = marketDelta[i].map((v) => (v === null || v === undefined || !Number.isFinite(v)) ? null : v);
+        }
+      } else {
+        if (dense && dense.denseStrikes && dense.denseIv && dense.denseIv[i]) {
+          hesX = dense.denseStrikes;
+          hesY = dense.denseIv[i].map((v) => (v === null || v === undefined || !Number.isFinite(v)) ? null : v);
+        } else if (cal.strikes && cal.hestonIv && cal.hestonIv[i]) {
+          // Fallback: use market-grid Heston IV from the calibration result.
+          hesX = cal.strikes;
+          hesY = cal.hestonIv[i].map((v) => (v === null || v === undefined || !Number.isFinite(v)) ? null : v);
+        }
       }
       if (hesX && hesY) traces.push({
         x: hesX, y: hesY,
@@ -890,13 +1030,14 @@ function renderSmiles() {
       paper_bgcolor: "#1a2029",
       plot_bgcolor: "#1a2029",
       font: { color: "#e7ecf2", size: 10 },
-      xaxis: { title: "Strike", gridcolor: "#2a3340", tickfont: { size: 9 } },
+      xaxis: { title: xTitle, gridcolor: "#2a3340", tickfont: { size: 9 }, autorange: useDelta ? "reversed" : true },
       yaxis: { title: "IV", gridcolor: "#2a3340", tickfont: { size: 9 } },
       showlegend: false,
     };
     Plotly.react(cellId, traces, layout, { responsive: true, displaylogo: false, displayModeBar: false });
   });
 }
+
 
 // ───── Single-expiry detail (within the Smiles tab) ─────
 function refreshSmileDetailControls() {
@@ -1008,13 +1149,34 @@ async function renderSmileDetail(hesData) {
   const safeIdx = Math.max(0, Math.min(surf.expiries.length - 1, idx || 0));
   const T = surf.expiries[safeIdx];
 
-  // Market trace at original strikes (skip null/NaN).
+  const wantDelta = getSmileXAxis() === "delta";
+  let mktDeltaRow = null;
+  if (wantDelta && state.calibration) {
+    try {
+      await ensureMarketSurfaceDeltaGrid();
+      mktDeltaRow = marketDeltaRow(safeIdx);
+    } catch (e) {
+      log("err", "smile", `delta fetch failed: ${e.message}`);
+    }
+  } else if (wantDelta && !state.calibration) {
+    log("warn", "smile", "delta axis requires a calibration — falling back to strike");
+  }
+  const useDelta = wantDelta && Array.isArray(mktDeltaRow);
+
+  // Market trace at original strikes (skip null/NaN). When delta-axis is selected, swap
+  // the x coordinate for the Heston-derived per-cell delta fetched above.
   const mktX = [], mktY = [];
   const ivRow = (surf.iv && surf.iv[safeIdx]) || [];
   for (let j = 0; j < surf.strikes.length; j++) {
     const v = ivRow[j];
     if (v === null || v === undefined || !Number.isFinite(v)) continue;
-    mktX.push(surf.strikes[j]);
+    if (useDelta) {
+      const d = mktDeltaRow[j];
+      if (d === null || !Number.isFinite(d)) continue;
+      mktX.push(d);
+    } else {
+      mktX.push(surf.strikes[j]);
+    }
     mktY.push(v);
   }
 
@@ -1050,8 +1212,23 @@ async function renderSmileDetail(hesData) {
     const hesY = heston.iv.map((v) =>
       (v === null || v === undefined || !Number.isFinite(v)) ? null : v
     );
+    // For delta-axis, fetch BS-deltas at the dense strike grid in a single call. The same
+    // endpoint computes IV and delta, but we already have the dense IV from fetchSmileDetailHeston
+    // — we just need the deltas for these specific (T, strikes).
+    let hesX = heston.strikes;
+    if (useDelta) {
+      try {
+        const r = await fetchHestonDelta([T], heston.strikes);
+        const drow = r?.delta?.[0];
+        if (Array.isArray(drow)) {
+          hesX = drow.map(v => (v === null || v === undefined || !Number.isFinite(v)) ? null : v);
+        }
+      } catch (e) {
+        log("err", "smile", `dense delta fetch failed: ${e.message}`);
+      }
+    }
     traces.push({
-      x: heston.strikes, y: hesY,
+      x: hesX, y: hesY,
       mode: "lines",
       type: "scatter",
       name: "Heston",
@@ -1071,7 +1248,7 @@ async function renderSmileDetail(hesData) {
     paper_bgcolor: "#1e2630",
     plot_bgcolor: "#1e2630",
     font: { color: "#e7ecf2" },
-    xaxis: { title: "Strike", gridcolor: "#2a3340" },
+    xaxis: { title: useDelta ? "Delta (call, Heston)" : "Strike", gridcolor: "#2a3340", autorange: useDelta ? "reversed" : true },
     yaxis: { title: "Implied volatility", gridcolor: "#2a3340" },
     showlegend: true,
     legend: { x: 1, xanchor: "right", y: 1 },
@@ -1853,6 +2030,829 @@ function hydrateFromSnapshot(snap) {
   }
 }
 
+// ───────────────── Swaption surface ─────────────────
+state.swaptionSurface = null;
+
+function buildSwaptionRequest() {
+  return {
+    optionExpiries:   parseCsvNumbers($("swaptionExpiries").value),
+    swapTenors:       parseCsvNumbers($("swaptionTenors").value),
+    strikeOffsetsBps: parseCsvNumbers($("swaptionOffsets").value),
+    asOf:             $("swaptionAsOf").value.trim() || null,
+    forceSynthetic:   $("swaptionForceSynthetic").checked,
+    couponFrequency:  2,
+  };
+}
+
+function swaptionAtmVol(pt) {
+  const fwd = pt.forwardSwapRate;
+  let bestIdx = 0, bestDist = Infinity;
+  for (let i = 0; i < pt.strikes.length; i++) {
+    const d = Math.abs(pt.strikes[i] - fwd);
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  }
+  return pt.marketVols[bestIdx] * 10000; // bps
+}
+
+function renderSwaptionHeatmap(data) {
+  const pts = data.volSurface;
+  const expiries = [...new Set(pts.map(p => p.optionExpiry))].sort((a, b) => a - b);
+  const tenors   = [...new Set(pts.map(p => p.swapTenor))].sort((a, b) => a - b);
+
+  const z = expiries.map(t =>
+    tenors.map(s => {
+      const pt = pts.find(p => Math.abs(p.optionExpiry - t) < 1e-9 && Math.abs(p.swapTenor - s) < 1e-9);
+      return pt ? swaptionAtmVol(pt) : null;
+    })
+  );
+
+  const layout = {
+    title: { text: `ATM Normal Vol (bps) — ${data.asOf}`, font: { size: 13 } },
+    margin: { t: 44, l: 80, r: 80, b: 60 },
+    paper_bgcolor: "#1e2630",
+    plot_bgcolor: "#1e2630",
+    font: { color: "#e7ecf2" },
+    xaxis: { title: "Swap tenor (yr)", tickvals: tenors, ticktext: tenors.map(t => `${t}Y`), gridcolor: "#2a3340" },
+    yaxis: { title: "Option expiry (yr)", tickvals: expiries, ticktext: expiries.map(t => `${t}Y`), gridcolor: "#2a3340" },
+  };
+  Plotly.react("plot-swaption-heatmap", [{
+    type: "heatmap",
+    x: tenors,
+    y: expiries,
+    z,
+    colorscale: "Viridis",
+    colorbar: { title: "ATM σ_N (bps)", thickness: 14 },
+    hovertemplate: "Expiry %{y}Y × Tenor %{x}Y<br>ATM vol: %{z:.1f} bps<extra></extra>",
+    connectgaps: false,
+  }], layout, { responsive: true, displaylogo: false });
+}
+
+// (swaption slice helpers removed — cube approach replaces per-slice UI)
+
+// Populate the source dropdown: first entry is always FRED, then all DB surfaces.
+async function populateSwaptionSourceDropdown() {
+  const sel = $("swaptionSourceSel");
+  const currentVal = sel.value;
+  sel.innerHTML = '<option value="fred">— Source from FRED —</option>';
+  try {
+    const rows = await apiGet("/api/db/swaption-surfaces");
+    rows.forEach(r => {
+      const ts = new Date(r.createdAt).toISOString().slice(0, 10);
+      const opt = document.createElement("option");
+      opt.value = `db:${r.id}`;
+      opt.textContent = `[DB ${r.id}] ${r.asOf} · ${r.source} (${r.nExpiries}×${r.nTenors} · ${r.nCells} cells · saved ${ts})`;
+      sel.appendChild(opt);
+    });
+    // Restore selection if it still exists.
+    if ([...sel.options].some(o => o.value === currentVal)) sel.value = currentVal;
+  } catch { /* DB not yet populated */ }
+  // Show/hide FRED config based on current selection.
+  updateSwaptionFredConfigVisibility();
+}
+
+function updateSwaptionFredConfigVisibility() {
+  const isFred = $("swaptionSourceSel").value === "fred";
+  $("swaptionFredConfig").classList.toggle("hidden", !isFred);
+}
+
+// Dispatcher: routes to FRED load or DB load based on the dropdown.
+async function loadSwaptionFromSource() {
+  const src = $("swaptionSourceSel").value;
+  if (src === "fred") {
+    await loadSwaptionSurface();
+  } else {
+    const id = parseInt(src.replace("db:", ""), 10);
+    await applySwaptionFromDb(id);
+  }
+}
+
+async function loadSwaptionSurface() {
+  clearError();
+  log("info", "swaption", "Loading surface from FRED");
+  setStatus("swaptionStatus", "Loading…", "busy");
+  $("loadSwaptionBtn").disabled = true;
+  try {
+    const req = buildSwaptionRequest();
+    if (!req.optionExpiries.length || !req.swapTenors.length) {
+      showError("Enter at least one option expiry and one swap tenor.");
+      return;
+    }
+    const data = await apiJson("/api/swaption/surface", req);
+    applySwaptionSurfaceData(data, null);
+  } catch (e) {
+    setStatus("swaptionStatus", "Failed", "err");
+    showError("Swaption surface load failed: " + e.message);
+    log("err", "swaption", e.message);
+  } finally {
+    $("loadSwaptionBtn").disabled = false;
+  }
+}
+
+// Load a surface from DB and restore its stored SABR calibrations if available.
+async function applySwaptionFromDb(id) {
+  clearError();
+  setStatus("swaptionStatus", `Loading DB id=${id}…`, "busy");
+  $("loadSwaptionBtn").disabled = true;
+  try {
+    const [data, calibRows] = await Promise.all([
+      apiGet(`/api/db/swaption-surface/${id}`),
+      apiGet(`/api/db/sabr-calibrations/${id}`).catch(() => []),
+    ]);
+    applySwaptionSurfaceData(data, calibRows.length ? calibRows : null);
+    setStatus("dbSwaptionStatus", `Loaded id=${id}`, "ok");
+    log("ok", "db", `Surface id=${id} loaded (${calibRows.length} SABR calibrations)`);
+  } catch (e) {
+    setStatus("swaptionStatus", "Failed", "err");
+    showError("Failed to load surface from DB: " + e.message);
+  } finally {
+    $("loadSwaptionBtn").disabled = false;
+  }
+}
+
+// Common surface application: updates state, renders UI, triggers SABR panel.
+// calibRows: array of SabrCalibrationRow from DB, or null to trigger fresh calibration.
+async function applySwaptionSurfaceData(data, calibRows) {
+  state.swaptionSurface = data;
+
+  const pill = $("swaptionSourcePill");
+  pill.textContent = `${data.asOf} · ${data.source}`;
+  pill.className = `status-pill ${(data.source || "").includes("FRED") ? "ok" : "busy"}`;
+
+  $("swaptionInfo").classList.remove("hidden");
+  renderSwaptionHeatmap(data);
+
+  const pts = data.volSurface;
+  const expiries = [...new Set(pts.map(p => p.optionExpiry))].sort((a, b) => a - b);
+  const tenors   = [...new Set(pts.map(p => p.swapTenor))].sort((a, b) => a - b);
+  const nStrikes = pts.length > 0 ? pts[0].strikes.length : 0;
+
+  const infoPill = $("sabrSurfaceInfoPill");
+  infoPill.textContent =
+    `${expiries.length} expiries (${expiries.map(e => `${e}Y`).join(", ")})  ·  ` +
+    `${tenors.length} tenors (${tenors.map(t => `${t}Y`).join(", ")})  ·  ` +
+    `${nStrikes} strikes per slice`;
+  $("sabrSurfaceInfo").classList.remove("hidden");
+
+  const cellCount = data.volSurface.length;
+  setStatus("swaptionStatus", `Loaded ${cellCount} cells`, "ok");
+  log("ok", "swaption", `${data.asOf} · ${cellCount} cells · ${data.source}`);
+
+  if (calibRows?.length) {
+    const convention = calibRows[0]?.convention ?? "Normal";
+    $("sabrCalibConvention").value = convention;
+    // Reconstruct cube from stored rows
+    const cube = {};
+    for (const r of calibRows) {
+      const t = r.swapTenor;
+      if (!cube[t]) cube[t] = [];
+      cube[t].push({
+        expiry: r.optionExpiry, forward: r.forward,
+        params: { alpha: r.alpha, beta: r.beta, rho: r.rho, nu: r.nu },
+        shift: r.shift, converged: r.converged, rmse: r.finalRmse,
+        strikes: null, marketVols: null, modelVols: null,
+      });
+    }
+    // Sort slices within each tenor by expiry
+    for (const t of Object.keys(cube)) cube[t].sort((a, b) => a.expiry - b.expiry);
+
+    // Fetch model vols for each slice so smile plots can show fit overlay
+    const fetchJobs = [];
+    for (const [tenorStr, slices] of Object.entries(cube)) {
+      const tenor = parseFloat(tenorStr);
+      for (const sl of slices) {
+        const pt = data.volSurface.find(p =>
+          Math.abs(p.optionExpiry - sl.expiry) < 1e-9 && Math.abs(p.swapTenor - tenor) < 1e-9
+        );
+        if (!pt) continue;
+        sl.strikes    = pt.strikes;
+        sl.marketVols = pt.marketVols;
+        fetchJobs.push(
+          apiJson("/api/sabr/vol", {
+            params: sl.params, forward: sl.forward, expiry: sl.expiry,
+            strikes: pt.strikes, shift: sl.shift, convention,
+          }).then(r => { sl.modelVols = r.vols; }).catch(() => {})
+        );
+      }
+    }
+    await Promise.all(fetchJobs);
+
+    state.sabrCalibCube = cube;
+    renderSabrCalibCube(cube, convention, data);
+    populateSabrSmilePlotsTenors(data, cube, convention);
+    renderSabrSmilePlotsGrid(data, cube, convention, tenors[0]);
+    populateSabrInterpTenors(tenors);
+
+    const nFail = Object.values(cube).flat().filter(s => !s.converged).length;
+    const nTotal = Object.values(cube).flat().length;
+    setStatus("sabrCalibStatus", `${nTotal} slices (from DB)` + (nFail ? ` · ⚠ ${nFail}` : ""), nFail ? "warn" : "ok");
+    $("sabrSaveDbBtn").disabled = false;
+    $("sabrSmilePlotsPanel").classList.remove("hidden");
+    $("sabrInterpPanel").classList.remove("hidden");
+  } else {
+    state.sabrCalibCube = null;
+    $("sabrCalibCubeWrap").classList.add("hidden");
+    calibrateSabrSurface();
+  }
+}
+
+// ───────────────── SABR calibration cube ─────────────────
+function parseCsvNumbers(str) {
+  return str.split(",").map(s => parseFloat(s.trim())).filter(v => Number.isFinite(v));
+}
+
+state.sabrCalibCube = null;
+// { [tenor]: [{expiry, forward, params, shift, converged, rmse, strikes, marketVols, modelVols}] }
+
+async function calibrateSabrSurface() {
+  if (!state.swaptionSurface) { showError("Load the swaption surface first."); return; }
+  const data = state.swaptionSurface;
+  const tenors = [...new Set(data.volSurface.map(p => p.swapTenor))].sort((a, b) => a - b);
+  const expiries = [...new Set(data.volSurface.map(p => p.optionExpiry))].sort((a, b) => a - b);
+  const beta       = parseFloat($("sabrCalibBeta").value);
+  const fixBeta    = $("sabrCalibFixBeta").checked;
+  const convention = $("sabrCalibConvention").value;
+
+  clearError();
+  setStatus("sabrCalibStatus", `Calibrating ${tenors.length}T × ${expiries.length}E…`, "busy");
+  $("sabrCalibBtn").disabled = true;
+
+  const cube = {};
+  let totalFail = 0;
+  let totalSlices = 0;
+
+  for (const tenor of tenors) {
+    const slices = data.volSurface
+      .filter(p => Math.abs(p.swapTenor - tenor) < 1e-9)
+      .sort((a, b) => a.optionExpiry - b.optionExpiry);
+    if (slices.length < 2) continue;
+
+    try {
+      const req = {
+        slices: slices.map(p => ({
+          forward: p.forwardSwapRate, expiry: p.optionExpiry,
+          strikes: p.strikes, marketVols: p.marketVols,
+        })),
+        beta, fixBeta, shift: 0, convention,
+      };
+      const res = await apiJson("/api/sabr/calibrate-surface", req);
+      cube[tenor] = res.slices.map((s, i) => ({
+        expiry:    slices[i].optionExpiry,
+        forward:   slices[i].forwardSwapRate,
+        params:    s.params,
+        shift:     0,
+        converged: s.converged,
+        rmse:      s.finalRmse,
+        strikes:   slices[i].strikes,
+        marketVols: slices[i].marketVols,
+        modelVols: s.modelVols,
+      }));
+      totalFail += res.slices.filter(s => !s.converged).length;
+      totalSlices += res.slices.length;
+    } catch (e) {
+      log("err", "sabr", `Tenor ${tenor}Y calibration failed: ${e.message}`);
+    }
+  }
+
+  state.sabrCalibCube = cube;
+  renderSabrCalibCube(cube, convention, data);
+  populateSabrSmilePlotsTenors(data, cube, convention);
+  renderSabrSmilePlotsGrid(data, cube, convention, tenors[0]);
+  populateSabrInterpTenors(tenors);
+
+  const msg = `${totalSlices} slices calibrated` + (totalFail ? ` · ⚠ ${totalFail}` : "");
+  setStatus("sabrCalibStatus", msg, totalFail ? "warn" : "ok");
+  log("ok", "sabr-surface", msg);
+
+  $("sabrCalibBtn").disabled = false;
+  $("sabrSaveDbBtn").disabled = false;
+  $("sabrSmilePlotsPanel").classList.remove("hidden");
+  $("sabrInterpPanel").classList.remove("hidden");
+
+  // Pre-fill interp inputs from first tenor's data
+  const firstTenorSlices = cube[tenors[0]] || [];
+  if (firstTenorSlices.length) {
+    const allK = firstTenorSlices.flatMap(s => s.strikes || []);
+    if (allK.length) {
+      $("sabrInterpStrikeMin").value = (Math.min(...allK) * 100).toFixed(2);
+      $("sabrInterpStrikeMax").value = (Math.max(...allK) * 100).toFixed(2);
+    }
+    const expList = firstTenorSlices.map(s => s.expiry);
+    $("sabrInterpExpiry").value = ((expList[0] + expList[expList.length - 1]) / 2).toFixed(2);
+  }
+}
+
+function renderSabrCalibCube(cube, convention, data) {
+  const pts = data.volSurface;
+  const expiries = [...new Set(pts.map(p => p.optionExpiry))].sort((a, b) => a - b);
+  const tenors   = [...new Set(pts.map(p => p.swapTenor))].sort((a, b) => a - b);
+  const isNormal = convention.toLowerCase() === "normal";
+
+  const parts = ['<table class="calib-cube-table"><thead><tr><th>Expiry \\ Tenor</th>'];
+  tenors.forEach(t => parts.push(`<th>${t}Y</th>`));
+  parts.push("</tr></thead><tbody>");
+
+  expiries.forEach(expiry => {
+    parts.push(`<tr><td class="cube-expiry">${expiry}Y</td>`);
+    tenors.forEach(tenor => {
+      const slices = cube[tenor] || [];
+      const s = slices.find(c => Math.abs(c.expiry - expiry) < 1e-9);
+      if (!s || !Number.isFinite(s.rmse)) {
+        parts.push('<td class="cube-empty">—</td>');
+      } else {
+        const a = isNormal ? (s.params.alpha * 10000).toFixed(1) + "bp" : fmt(s.params.alpha, 4);
+        const rmse = isNormal ? (s.rmse * 10000).toFixed(2) + "bp" : fmt(s.rmse, 4);
+        const convCls = s.converged ? "conv" : "noconv";
+        const encoded = encodeURIComponent(JSON.stringify({
+          expiry, tenor, params: s.params, shift: s.shift,
+          forward: s.forward, converged: s.converged, rmse: s.rmse, convention,
+        }));
+        parts.push(`<td class="cube-cell ${convCls}" data-params="${encoded}" onclick="openSabrModal(this)">` +
+          `α=${a}, ρ=${fmt(s.params.rho,2)}, ν=${fmt(s.params.nu,2)}, ${rmse}` +
+          ` <span class="conv-flag">${s.converged ? "✓" : "⚠"}</span></td>`);
+      }
+    });
+    parts.push("</tr>");
+  });
+
+  parts.push("</tbody></table>");
+  const wrap = $("sabrCalibCubeWrap");
+  wrap.innerHTML = parts.join("");
+  wrap.classList.remove("hidden");
+}
+
+function openSabrModal(cell) {
+  const raw = cell.dataset.params;
+  if (!raw) return;
+  const d = JSON.parse(decodeURIComponent(raw));
+  const isNormal = (d.convention || "").toLowerCase() === "normal";
+  const sc = isNormal ? 10000 : 1;
+  const u  = isNormal ? " bps" : "";
+  $("sabrModalTitle").textContent = `SABR — ${d.expiry}Y expiry × ${d.tenor}Y tenor`;
+  const rows = [
+    ["α (alpha)", fmt(d.params.alpha * sc, isNormal ? 2 : 6) + u],
+    ["β (beta)",  fmt(d.params.beta, 4)],
+    ["ρ (rho)",   fmt(d.params.rho, 4)],
+    ["ν (nu)",    fmt(d.params.nu, 4)],
+    ["Shift",     fmt(d.shift, 4)],
+    ["RMSE",      fmt(d.rmse * sc, isNormal ? 3 : 6) + u],
+    ["Forward",   fmt(d.forward * 100, 3) + "%"],
+    ["Converged", d.converged ? "Yes" : "No ⚠"],
+  ];
+  $("sabrModalTableBody").innerHTML =
+    rows.map(([k, v]) => `<tr><td>${k}</td><td class="value">${v}</td></tr>`).join("");
+  $("sabrParamsModal").classList.remove("hidden");
+}
+
+function closeSabrModal() {
+  $("sabrParamsModal").classList.add("hidden");
+}
+
+// ───────────────── Smile Plots ─────────────────
+
+function populateSabrSmilePlotsTenors(data, cube, convention) {
+  const tenors = [...new Set(data.volSurface.map(p => p.swapTenor))].sort((a, b) => a - b);
+  const sel = $("smilePlotsTenorSel");
+  const prev = sel.value;
+  sel.innerHTML = "";
+  tenors.forEach(t => {
+    const o = document.createElement("option");
+    o.value = String(t); o.textContent = `${t}Y`;
+    sel.appendChild(o);
+  });
+  if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+}
+
+function renderSabrSmilePlotsGrid(data, cube, convention, tenor) {
+  const grid = $("sabrSmilePlotsGrid");
+  grid.innerHTML = "";
+  const isNormal = convention.toLowerCase() === "normal";
+  const scale    = isNormal ? 10000 : 1;
+  const yLabel   = isNormal ? "Normal vol (bps)" : "Lognormal vol";
+
+  const slices = (cube[tenor] || []).sort((a, b) => a.expiry - b.expiry);
+  if (!slices.length) {
+    grid.innerHTML = `<p style="color:var(--text-dim);padding:8px">No calibrated slices for tenor ${tenor}Y.</p>`;
+    return;
+  }
+
+  slices.forEach((sl, idx) => {
+    const cellId = `sabr-sp-${String(sl.expiry).replace(".", "_")}-${String(tenor).replace(".", "_")}`;
+    const div = document.createElement("div");
+    div.className = "smile-tile";
+    div.id = cellId;
+    grid.appendChild(div);
+
+    const mktX = (sl.strikes || []).map(k => k * 100);
+    const mktY = (sl.marketVols || []).map(v => v * scale);
+    const traces = [{
+      x: mktX, y: mktY, mode: "markers", type: "scatter", name: "Market",
+      marker: { color: COLORS.market, size: 6 }, showlegend: idx === 0,
+    }];
+    if (sl.modelVols?.length) {
+      traces.push({
+        x: mktX, y: sl.modelVols.map(v => v * scale),
+        mode: "lines", type: "scatter", name: "SABR",
+        line: { color: COLORS.heston, width: 2 }, showlegend: idx === 0,
+      });
+    }
+
+    const rmseStr = Number.isFinite(sl.rmse)
+      ? (isNormal ? (sl.rmse * 10000).toFixed(2) + "bp" : sl.rmse.toFixed(4))
+      : "—";
+    const layout = {
+      title: { text: `${sl.expiry}Y × ${tenor}Y  F=${fmt(sl.forward*100,3)}%  RMSE=${rmseStr}`, font: { size: 10 } },
+      margin: { t: 36, l: 44, r: 8, b: 36 },
+      paper_bgcolor: "#1a2029", plot_bgcolor: "#1a2029",
+      font: { color: "#e7ecf2", size: 9 },
+      xaxis: { title: "Strike (%)", gridcolor: "#2a3340", tickfont: { size: 8 } },
+      yaxis: { title: yLabel,       gridcolor: "#2a3340", tickfont: { size: 8 } },
+      showlegend: false,
+    };
+    Plotly.react(cellId, traces, layout, { responsive: true, displaylogo: false, displayModeBar: false });
+  });
+
+  const nFail = slices.filter(s => !s.converged).length;
+  setStatus("sabrSmilesInfo",
+    `${slices.length} slices for ${tenor}Y` + (nFail ? ` · ⚠ ${nFail} not converged` : ""),
+    nFail ? "warn" : "ok");
+}
+
+// ───────────────── Smile Interpolation ─────────────────
+
+function populateSabrInterpTenors(tenors) {
+  const sels = [$("sabrInterpTenorSel")];
+  sels.forEach(sel => {
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = "";
+    tenors.forEach(t => {
+      const o = document.createElement("option");
+      o.value = String(t); o.textContent = `${t}Y`;
+      sel.appendChild(o);
+    });
+    if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+  });
+}
+
+async function computeSabrInterpolatedSmile() {
+  const cube = state.sabrCalibCube;
+  if (!cube) { showError("Calibrate SABR surface first."); return; }
+
+  const tenor       = parseFloat($("sabrInterpTenorSel").value);
+  const targetExpiry = parseFloat($("sabrInterpExpiry").value);
+  const strikeMinPct = parseFloat($("sabrInterpStrikeMin").value);
+  const strikeMaxPct = parseFloat($("sabrInterpStrikeMax").value);
+  const nPoints      = parseInt($("sabrInterpPoints").value, 10);
+  const convention   = $("sabrCalibConvention").value;
+
+  const slices = cube[tenor];
+  if (!slices || slices.length < 2) {
+    showError(`Need at least 2 calibrated expiries for tenor ${tenor}Y.`); return;
+  }
+  if (!Number.isFinite(targetExpiry) || targetExpiry <= 0) { showError("Enter a valid target expiry."); return; }
+  if (strikeMinPct >= strikeMaxPct) { showError("Strike min must be less than strike max."); return; }
+
+  clearError();
+  setStatus("sabrInterpStatus", "Computing…", "busy");
+  $("sabrInterpBtn").disabled = true;
+  try {
+    const req = {
+      slices: slices.map(c => ({ expiry: c.expiry, forward: c.forward, params: c.params, shift: c.shift })),
+      targetExpiry,
+      strikeMin: strikeMinPct / 100,
+      strikeMax: strikeMaxPct / 100,
+      nPoints,
+      convention,
+    };
+    const res = await apiJson("/api/sabr/interpolate-smile", req);
+    const isNormal = convention.toLowerCase() === "normal";
+    const sc = isNormal ? 10000 : 1;
+    const yLabel = isNormal ? "Normal Vol (bps)" : "Lognormal Vol";
+    const calibExpiries = slices.map(c => c.expiry);
+    const extrapolating = targetExpiry < Math.min(...calibExpiries) || targetExpiry > Math.max(...calibExpiries);
+    const trace = {
+      x: res.strikes.map(k => k * 100),
+      y: res.vols.map(v => v * sc),
+      mode: "lines", type: "scatter",
+      name: `T=${targetExpiry}y${extrapolating ? " (extrap.)" : ""}`,
+      line: { color: extrapolating ? "#f5a623" : COLORS.heston, width: 2, dash: extrapolating ? "dash" : "solid" },
+    };
+    const layout = {
+      title: { text: `SABR smile — tenor ${tenor}Y, T=${targetExpiry}y (variance interpolated)`, font: { size: 12 } },
+      margin: { t: 50, l: 60, r: 20, b: 50 },
+      paper_bgcolor: "#1e2630", plot_bgcolor: "#1e2630",
+      font: { color: "#e7ecf2" },
+      xaxis: { title: "Strike (%)", gridcolor: "#2a3340" },
+      yaxis: { title: yLabel,       gridcolor: "#2a3340" },
+      showlegend: true, legend: { x: 1, xanchor: "right", y: 1 },
+      annotations: [{
+        x: 0.01, y: 0.98, xref: "paper", yref: "paper", xanchor: "left", yanchor: "top",
+        text: `Calibrated: ${calibExpiries.map(e => `${e}Y`).join(", ")}` +
+              (extrapolating ? "<br>⚠ outside calibrated range" : ""),
+        showarrow: false, font: { size: 10, color: "#8a9bb0" }, bgcolor: "rgba(30,38,48,0.7)",
+      }],
+    };
+    Plotly.react("plot-sabr-interp", [trace], layout, { responsive: true, displaylogo: false });
+    const atmVol = res.vols[Math.round(nPoints / 2)] * sc;
+    const msg = `ATM ≈${fmt(atmVol, 2)}${isNormal ? " bps" : ""} · F=${fmt(res.targetForward * 100, 3)}%`;
+    setStatus("sabrInterpStatus", msg, "ok");
+    log("ok", "sabr", `interpolated: T=${targetExpiry}y tenor=${tenor}Y ${msg}`);
+    // Pre-fill annuity from surface data so Greeks are ready to compute.
+    const autoAnnuity = getInterpolatedAnnuity(tenor, targetExpiry);
+    const annuityInp = $("sabrGreeksAnnuity");
+    if (annuityInp) annuityInp.value = autoAnnuity.toFixed(4);
+  } catch (e) {
+    setStatus("sabrInterpStatus", "Failed", "err");
+    showError("Smile interpolation failed: " + e.message);
+  } finally {
+    $("sabrInterpBtn").disabled = false;
+  }
+}
+
+// ───────────────── SABR Greeks ─────────────────
+
+// Linearly interpolate annuity from surface pillar data for (tenor, targetExpiry).
+function getInterpolatedAnnuity(tenor, targetExpiry) {
+  const data = state.swaptionSurface;
+  if (!data) return 1.0;
+  const pts = data.volSurface
+    .filter(p => Math.abs(p.swapTenor - tenor) < 1e-9)
+    .sort((a, b) => a.optionExpiry - b.optionExpiry);
+  if (!pts.length) return 1.0;
+  if (targetExpiry <= pts[0].optionExpiry) return pts[0].annuity;
+  if (targetExpiry >= pts[pts.length - 1].optionExpiry) return pts[pts.length - 1].annuity;
+  for (let i = 0; i < pts.length - 1; i++) {
+    if (targetExpiry >= pts[i].optionExpiry && targetExpiry <= pts[i + 1].optionExpiry) {
+      const t0 = pts[i].optionExpiry, t1 = pts[i + 1].optionExpiry;
+      const w = (targetExpiry - t0) / (t1 - t0);
+      return pts[i].annuity * (1 - w) + pts[i + 1].annuity * w;
+    }
+  }
+  return pts[pts.length - 1].annuity;
+}
+
+async function computeSabrGreeks() {
+  const cube = state.sabrCalibCube;
+  if (!cube) { showError("Calibrate SABR surface first."); return; }
+
+  const tenor        = parseFloat($("sabrInterpTenorSel").value);
+  const targetExpiry = parseFloat($("sabrInterpExpiry").value);
+  const strikeMinPct = parseFloat($("sabrInterpStrikeMin").value);
+  const strikeMaxPct = parseFloat($("sabrInterpStrikeMax").value);
+  const nPoints      = parseInt($("sabrInterpPoints").value, 10);
+  const convention   = $("sabrCalibConvention").value;
+  const isPayer      = $("sabrGreeksIsPayer").checked;
+
+  // Auto-fill annuity from surface data if not yet set by user.
+  let annuity = parseFloat($("sabrGreeksAnnuity").value);
+  if (!Number.isFinite(annuity) || annuity <= 0) {
+    annuity = getInterpolatedAnnuity(tenor, targetExpiry);
+    $("sabrGreeksAnnuity").value = annuity.toFixed(4);
+  }
+
+  const slices = cube[tenor];
+  if (!slices || slices.length < 2) { showError(`Need at least 2 calibrated expiries for tenor ${tenor}Y.`); return; }
+  if (!Number.isFinite(targetExpiry) || targetExpiry <= 0) { showError("Enter a valid target expiry."); return; }
+  if (strikeMinPct >= strikeMaxPct) { showError("Strike min must be less than strike max."); return; }
+
+  clearError();
+  setStatus("sabrGreeksStatus", "Computing…", "busy");
+  $("sabrGreeksBtn").disabled = true;
+
+  try {
+    const req = {
+      slices: slices.map(c => ({ expiry: c.expiry, forward: c.forward, params: c.params, shift: c.shift })),
+      targetExpiry,
+      strikeMin: strikeMinPct / 100,
+      strikeMax: strikeMaxPct / 100,
+      nPoints,
+      convention,
+      annuity,
+      isPayer,
+    };
+    const res = await apiJson("/api/sabr/greeks", req);
+    renderSabrGreeksTable(res, convention);
+    setStatus("sabrGreeksStatus",
+      `${res.greeks.length} strikes · F=${fmt(res.targetForward * 100, 3)}% · annuity=${fmt(annuity, 4)}`, "ok");
+    log("ok", "sabr-greeks", `T=${targetExpiry}y tenor=${tenor}Y isPayer=${isPayer} annuity=${fmt(annuity,4)}`);
+  } catch (e) {
+    setStatus("sabrGreeksStatus", "Failed", "err");
+    showError("Greeks computation failed: " + e.message);
+  } finally {
+    $("sabrGreeksBtn").disabled = false;
+  }
+}
+
+function renderSabrGreeksTable(res, convention) {
+  const wrap = $("sabrGreeksTableWrap");
+  if (!wrap) return;
+  const isNormal = convention.toLowerCase() === "normal";
+  const volScale = isNormal ? 10000 : 1;
+
+  const parts = [
+    '<div style="overflow-x:auto;margin-top:8px">',
+    '<table class="greeks-table" style="min-width:680px;font-size:0.82em">',
+    '<thead><tr>',
+    '<th>Strike (%)</th>',
+    `<th>Vol${isNormal ? " (bps)" : ""}</th>`,
+    '<th>Price</th>',
+    '<th>Delta</th>',
+    '<th>Gamma</th>',
+    '<th>Vega</th>',
+    '<th>Vanna</th>',
+    '<th>Volga</th>',
+    '</tr></thead><tbody>',
+  ];
+  for (const row of res.greeks) {
+    parts.push(
+      `<tr>` +
+      `<td class="value">${(row.strike * 100).toFixed(3)}</td>` +
+      `<td class="value">${fmtGreek(row.vol * volScale)}</td>` +
+      `<td class="value">${fmtGreek(row.price)}</td>` +
+      `<td class="value">${fmtGreek(row.delta)}</td>` +
+      `<td class="value">${fmtGreek(row.gamma)}</td>` +
+      `<td class="value">${fmtGreek(row.vega)}</td>` +
+      `<td class="value">${fmtGreek(row.vanna)}</td>` +
+      `<td class="value">${fmtGreek(row.volga)}</td>` +
+      `</tr>`
+    );
+  }
+  parts.push('</tbody></table></div>');
+  wrap.innerHTML = parts.join("");
+}
+
+// ───────────────── Database panel ─────────────────
+
+async function dbSaveSwaptionSurface() {
+  if (!state.swaptionSurface) { showError("Load a swaption surface first."); return; }
+  setStatus("dbSwaptionStatus", "Saving…", "busy");
+  try {
+    const r = await apiJson("/api/db/swaption-surface/save", state.swaptionSurface);
+    const surfaceId = r.id;
+    setStatus("dbSwaptionStatus", `Saved (id=${surfaceId})`, "ok");
+    log("ok", "db", `Swaption surface saved, id=${surfaceId}`);
+
+    // Save all tenors from the calibration cube.
+    const cube = state.sabrCalibCube;
+    if (cube && Object.keys(cube).length) {
+      const conv = $("sabrCalibConvention").value;
+      const entries = [];
+      for (const [tenorStr, slices] of Object.entries(cube)) {
+        const tenor = parseFloat(tenorStr);
+        for (const c of slices) {
+          entries.push({
+            optionExpiry: c.expiry, swapTenor: tenor,
+            forward: c.forward, alpha: c.params.alpha, beta: c.params.beta,
+            rho: c.params.rho, nu: c.params.nu, shift: c.shift,
+            finalRmse: c.rmse, converged: c.converged, convention: conv,
+          });
+        }
+      }
+      if (entries.length) {
+        await apiJson(`/api/db/sabr-calibrations/${surfaceId}`, entries);
+        log("ok", "db", `${entries.length} SABR calibrations saved for surface id=${surfaceId}`);
+      }
+    }
+    await dbRefreshSwaptionTable();
+    await populateSwaptionSourceDropdown();
+  } catch (e) {
+    setStatus("dbSwaptionStatus", "Failed", "err");
+    showError("DB save failed: " + e.message);
+  }
+}
+
+async function dbRefreshSwaptionTable() {
+  try {
+    const rows = await apiGet("/api/db/swaption-surfaces");
+    const tbody = $("dbSwaptionTableBody");
+    tbody.innerHTML = "";
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="8" style="color:var(--text-dim)">No surfaces stored yet.</td></tr>';
+      return;
+    }
+    rows.forEach(r => {
+      const ts = new Date(r.createdAt).toISOString().slice(0, 16).replace("T", " ");
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="value">${r.id}</td>
+        <td class="value">${r.asOf}</td>
+        <td class="value" style="max-width:120px;overflow:hidden;text-overflow:ellipsis">${r.source}</td>
+        <td class="value">${r.nExpiries}</td>
+        <td class="value">${r.nTenors}</td>
+        <td class="value">${r.nCells}</td>
+        <td class="value">${ts}</td>
+        <td><button class="ghost" style="font-size:0.8em;padding:2px 8px"
+            onclick="applySwaptionFromDb(${r.id})">Load</button></td>`;
+      tbody.appendChild(tr);
+    });
+  } catch (e) {
+    log("err", "db", "Failed to refresh swaption list: " + e.message);
+  }
+}
+
+
+async function dbSaveHestonSurface() {
+  if (!state.surface) { showError("Load a Heston surface first."); return; }
+  setStatus("dbHestonStatus", "Saving…", "busy");
+  try {
+    const r = await apiJson("/api/db/heston-surface/save", state.surface);
+    const surfaceId = r.id;
+    setStatus("dbHestonStatus", `Saved (id=${surfaceId})`, "ok");
+    log("ok", "db", `Heston surface saved, id=${surfaceId}`);
+
+    // Save calibration result if available.
+    if (state.calibration?.params) {
+      const c = state.calibration.params;
+      await apiJson(`/api/db/heston-calibration/${surfaceId}`, {
+        ticker: state.surface.ticker,
+        asOf: new Date().toISOString().slice(0, 10),
+        kappa: c.kappa, theta: c.theta, sigma: c.sigma,
+        rho: c.rho, v0: c.v0,
+        finalRmse: state.calibration.finalRmse ?? 0,
+      });
+      log("ok", "db", `Heston calibration saved for surface id=${surfaceId}`);
+    }
+    await dbRefreshHestonTables();
+  } catch (e) {
+    setStatus("dbHestonStatus", "Failed", "err");
+    showError("DB save failed: " + e.message);
+  }
+}
+
+async function dbRefreshHestonTables() {
+  try {
+    const [surfaces, calibs] = await Promise.all([
+      apiGet("/api/db/heston-surfaces"),
+      apiGet("/api/db/heston-calibrations"),
+    ]);
+
+    const surfBody = $("dbHestonTableBody");
+    surfBody.innerHTML = "";
+    if (!surfaces.length) {
+      surfBody.innerHTML = '<tr><td colspan="8" style="color:var(--text-dim)">No surfaces stored yet.</td></tr>';
+    } else {
+      surfaces.forEach(r => {
+        const ts = new Date(r.createdAt).toISOString().slice(0, 16).replace("T", " ");
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td class="value">${r.id}</td>
+          <td class="value">${r.ticker}</td>
+          <td class="value">${fmt(r.spot, 2)}</td>
+          <td class="value">${r.nExpiries}</td>
+          <td class="value">${r.nStrikes}</td>
+          <td class="value" style="max-width:100px;overflow:hidden;text-overflow:ellipsis">${r.source}</td>
+          <td class="value">${ts}</td>
+          <td><button class="ghost" style="font-size:0.8em;padding:2px 8px"
+              onclick="dbLoadHestonSurface(${r.id})">Load</button></td>`;
+        surfBody.appendChild(tr);
+      });
+    }
+
+    const calibBody = $("dbHestonCalibTableBody");
+    calibBody.innerHTML = "";
+    if (!calibs.length) {
+      calibBody.innerHTML = '<tr><td colspan="10" style="color:var(--text-dim)">No calibrations stored yet.</td></tr>';
+    } else {
+      calibs.forEach(c => {
+        const ts = new Date(c.createdAt).toISOString().slice(0, 16).replace("T", " ");
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td class="value">${c.hestonSurfaceId}</td>
+          <td class="value">${c.ticker}</td>
+          <td class="value">${c.asOf}</td>
+          <td class="value">${fmt(c.kappa, 4)}</td>
+          <td class="value">${fmt(c.theta, 4)}</td>
+          <td class="value">${fmt(c.sigma, 4)}</td>
+          <td class="value">${fmt(c.rho, 4)}</td>
+          <td class="value">${fmt(c.v0, 4)}</td>
+          <td class="value">${fmt(c.finalRmse * 100, 4)}%</td>
+          <td class="value">${ts}</td>`;
+        calibBody.appendChild(tr);
+      });
+    }
+  } catch (e) {
+    log("err", "db", "Failed to refresh Heston tables: " + e.message);
+  }
+}
+
+async function dbLoadHestonSurface(id) {
+  setStatus("dbHestonStatus", `Loading id=${id}…`, "busy");
+  try {
+    const data = await apiGet(`/api/db/heston-surface/${id}`);
+    state.surface = data;
+    renderMarketSurface(getSelectedMarketQty());
+    renderMarketCut();
+    $("calibPanel").classList.remove("hidden");
+    $("tabsSection").classList.remove("hidden");
+    switchTab("market");
+    setStatus("dbHestonStatus", `Loaded id=${id}`, "ok");
+    log("ok", "db", `Heston surface id=${id} loaded from DB`);
+  } catch (e) {
+    setStatus("dbHestonStatus", "Failed", "err");
+    showError("DB load failed: " + e.message);
+  }
+}
+
 // ───────────────── Wiring ─────────────────
 function wireUi() {
   setupLogPanel();
@@ -1877,6 +2877,17 @@ function wireUi() {
   if (cutSel) cutSel.addEventListener("change", () => {
     if (state.surface) renderMarketCut();
   });
+
+  // Smile-cut x-axis toggle (Strike / Delta). The radios live in the Market tab but the
+  // selection is global — switching also re-renders Smiles tab tiles and the single-expiry
+  // detail so the entire smile-view stays internally consistent.
+  for (const r of $$('input[name="smileXAxis"]')) {
+    r.addEventListener("change", () => {
+      if (state.surface) renderMarketCut();
+      renderSmiles?.();
+      if (state.smileDetail?.rendered) renderSmileDetail?.();
+    });
+  }
 
   // Show/hide NM restarts depending on global method.
   const refreshNm = () => {
@@ -1910,6 +2921,65 @@ function wireUi() {
   $("loadSnapshotBtn").addEventListener("click", loadSnapshot);
   $("deleteSnapshotBtn").addEventListener("click", deleteSnapshot);
   refreshSnapshotList();
+
+  // Swaption surface section.
+  $("loadSwaptionBtn").addEventListener("click", loadSwaptionFromSource);
+  $("swaptionSourceSel").addEventListener("change", updateSwaptionFredConfigVisibility);
+  $("toggleSwaptionBtn").addEventListener("click", () => {
+    const body = $("swaptionBody");
+    const hidden = body.classList.toggle("hidden");
+    $("toggleSwaptionBtn").textContent = hidden ? "Expand" : "Collapse";
+  });
+
+  // SABR Calibration section.
+  $("sabrCalibBtn").addEventListener("click", calibrateSabrSurface);
+  $("sabrSaveDbBtn").addEventListener("click", dbSaveSwaptionSurface);
+  $("toggleSabrCalibBtn").addEventListener("click", () => {
+    const body = $("sabrCalibBody");
+    const hidden = body.classList.toggle("hidden");
+    $("toggleSabrCalibBtn").textContent = hidden ? "Expand" : "Collapse";
+  });
+
+  // Smile Plots section.
+  $("smilePlotsTenorSel").addEventListener("change", () => {
+    const cube = state.sabrCalibCube;
+    if (!cube || !state.swaptionSurface) return;
+    const tenor = parseFloat($("smilePlotsTenorSel").value);
+    renderSabrSmilePlotsGrid(state.swaptionSurface, cube, $("sabrCalibConvention").value, tenor);
+  });
+  $("toggleSabrSmilesBtn").addEventListener("click", () => {
+    const body = $("sabrSmilesBody");
+    const hidden = body.classList.toggle("hidden");
+    $("toggleSabrSmilesBtn").textContent = hidden ? "Expand" : "Collapse";
+  });
+
+  // Smile Interpolation section.
+  $("sabrInterpBtn").addEventListener("click", computeSabrInterpolatedSmile);
+  $("sabrGreeksBtn").addEventListener("click", computeSabrGreeks);
+  $("toggleSabrInterpBtn").addEventListener("click", () => {
+    const body = $("sabrInterpBody");
+    const hidden = body.classList.toggle("hidden");
+    $("toggleSabrInterpBtn").textContent = hidden ? "Expand" : "Collapse";
+  });
+
+  // Modal close.
+  $("sabrModalCloseBtn").addEventListener("click", closeSabrModal);
+  $("sabrParamsModal").addEventListener("click", e => { if (e.target === $("sabrParamsModal")) closeSabrModal(); });
+
+  // Database panel.
+  $("dbSaveSwaptionBtn").addEventListener("click", dbSaveSwaptionSurface);
+  $("dbRefreshSwaptionBtn").addEventListener("click", dbRefreshSwaptionTable);
+  $("dbSaveHestonBtn").addEventListener("click", dbSaveHestonSurface);
+  $("dbRefreshHestonBtn").addEventListener("click", dbRefreshHestonTables);
+  $("toggleDbBtn").addEventListener("click", () => {
+    const body = $("dbBody");
+    const hidden = body.classList.toggle("hidden");
+    $("toggleDbBtn").textContent = hidden ? "Expand" : "Collapse";
+  });
+  // Load tables and populate source dropdown on startup.
+  populateSwaptionSourceDropdown();
+  dbRefreshSwaptionTable();
+  dbRefreshHestonTables();
 
   // Resize on window resize for visible plots.
   window.addEventListener("resize", () => {
